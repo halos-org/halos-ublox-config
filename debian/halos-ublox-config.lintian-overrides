@@ -1,0 +1,2 @@
+# CI generates debian/changelog dynamically, so there is no ITP bug to close
+halos-ublox-config: initial-upload-closes-no-bugs
