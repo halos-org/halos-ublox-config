@@ -1,0 +1,9 @@
+name: 'Run Tests'
+description: 'Run tests for halos-ublox-config (shellcheck only)'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Run shellcheck
+      run: shellcheck usr/libexec/halos/*.sh
+      shell: bash
