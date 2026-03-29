@@ -1,0 +1,19 @@
+name: 'Build Debian Package'
+description: 'Build .deb package using native dpkg tools'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install build dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y dpkg-dev debhelper build-essential
+
+    - name: Build Debian package
+      shell: bash
+      run: |
+        dpkg-buildpackage -b -uc -us
+        mv ../*.deb ./
+        echo "Built packages:"
+        ls -lh *.deb

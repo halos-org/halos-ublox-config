@@ -1,0 +1,13 @@
+# Lefthook configuration
+# Install with: ./run install-hooks
+
+pre-commit:
+  parallel: true
+  commands:
+    check-changelog:
+      run: .github/scripts/check-changelog-edits.sh
+      fail_text: "Direct debian/changelog edits are not allowed. Use './run bumpversion' instead."
+    shellcheck:
+      glob: "usr/libexec/halos/*.sh"
+      run: shellcheck {staged_files}
+      fail_text: "shellcheck found issues in shell scripts"

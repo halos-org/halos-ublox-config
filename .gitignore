@@ -1,0 +1,7 @@
+*.deb
+*.buildinfo
+*.changes
+debian/debhelper-build-stamp
+debian/files
+debian/halos-ublox-config.substvars
+debian/halos-ublox-config/

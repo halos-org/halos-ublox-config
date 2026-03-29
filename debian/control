@@ -1,0 +1,22 @@
+Source: halos-ublox-config
+Section: misc
+Priority: optional
+Maintainer: Matti Airas <matti.airas@hatlabs.fi>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Homepage: https://github.com/halos-org/halos-ublox-config
+Rules-Requires-Root: no
+
+Package: halos-ublox-config
+Architecture: all
+Depends: ${misc:Depends}, gpsd-clients
+Description: u-blox GNSS receiver auto-configuration for marine use
+ Configures u-blox GNSS receivers connected via UART for marine use.
+ Runs on every boot to ensure correct configuration, since ROM-based
+ u-blox modules (such as the MAX-M8Q) cannot persist settings without
+ a backup battery.
+ .
+ Configuration applied:
+  * 10 Hz update rate (100 ms measurement interval)
+  * Sea dynamic model (optimized for marine navigation)
+  * 115200 bps baud rate

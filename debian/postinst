@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # Clean up old unmanaged files from pi-gen
+        rm -f /etc/systemd/system/configure-gnss-marine.service
+        rm -f /usr/libexec/halos/configure-gnss-marine.sh
+        rm -f /var/lib/halos/gnss-marine-configured
+        rm -f /var/lib/halos/gnss-marine-attempts
+        # Reload and enable
+        if [ -d /run/systemd/system ]; then
+            systemctl daemon-reload
+            systemctl enable configure-ublox-marine.service
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

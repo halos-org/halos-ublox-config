@@ -1,0 +1,24 @@
+name: Main Branch CI/CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.repository }}-main-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    uses: halos-org/shared-workflows/.github/workflows/build-release.yml@main
+    with:
+      package-name: halos-ublox-config
+      package-description: 'u-blox GNSS receiver auto-configuration for marine use'
+      apt-distro: trixie
+      apt-component: main
+    secrets:
+      APT_REPO_PAT: ${{ secrets.APT_REPO_PAT }}

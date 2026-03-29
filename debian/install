@@ -1,0 +1,2 @@
+usr/libexec/halos/configure-ublox-marine.sh usr/libexec/halos/
+lib/systemd/system/configure-ublox-marine.service lib/systemd/system/
