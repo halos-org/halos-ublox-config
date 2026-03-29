@@ -1,17 +1,16 @@
-name: Publish Release
+name: Release Published
 
 on:
   release:
     types: [published]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   publish:
-    uses: halos-org/shared-workflows/.github/workflows/publish-release.yml@main
+    uses: halos-org/shared-workflows/.github/workflows/publish-stable.yml@main
     with:
-      package-name: halos-ublox-config
       apt-distro: trixie
       apt-component: main
     secrets:
