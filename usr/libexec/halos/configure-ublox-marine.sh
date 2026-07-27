@@ -29,8 +29,11 @@ get_uart_devices() {
 probe_receiver() {
     local device="$1" baud="$2" output
     output=$(ubxtool -f "$device" -s "$baud" -w "$UBXTOOL_WAIT" -p MON-VER 2>/dev/null)
-    # ubxtool exits 0 even with no response; validate actual UBX output
-    echo "$output" | grep -q "MON-VER" || return 1
+    # ubxtool exits 0 even with no response; validate actual UBX output.
+    # Match in-shell, not via `echo | grep -q`: grep -q closes the pipe on the
+    # first match, and under `set -o pipefail` echo's resulting SIGPIPE reads as
+    # a false "no receiver" whenever the receiver is already streaming NAV.
+    [[ "$output" == *"MON-VER"* ]] || return 1
     echo "$output"
 }
 
