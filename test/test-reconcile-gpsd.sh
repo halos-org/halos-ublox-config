@@ -90,6 +90,23 @@ else
     fail "missing defaults file returned non-zero"
 fi
 
+# --- probe_receiver: no false negative on a streaming receiver ---
+# Regression guard: a large ubxtool output (receiver already tracking) must not
+# read as "no receiver" via an echo|grep-q SIGPIPE under pipefail.
+ubxtool() { printf 'UBX-MON-VER:\n  swVersion ROM CORE 3.01\n'; seq 1 200000; }
+if probe_receiver /dev/ttyAMA0 115200 >/dev/null; then
+    pass "probe_receiver detects a streaming receiver (large output)"
+else
+    fail "probe_receiver false-negative on large output"
+fi
+ubxtool() { printf 'garbage\nno marker here\n'; }
+if probe_receiver /dev/ttyAMA0 115200 >/dev/null; then
+    fail "probe_receiver should report no receiver when MON-VER is absent"
+else
+    pass "probe_receiver reports no receiver when MON-VER is absent"
+fi
+unset -f ubxtool   # don't let the stub leak into later tests
+
 # --- main() orchestration ---
 # Stub discovery, per-device configuration, and reconcile so main()'s decisions
 # (reconcile only after a configured receiver; warn only on genuine failure) are
