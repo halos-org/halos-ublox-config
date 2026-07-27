@@ -45,6 +45,13 @@ function lint {
   echo "shellcheck passed"
 }
 
+function test {
+  #@ Run shellcheck and unit tests
+  #@ Category: Quality
+  lint
+  bash test/test-reconcile-gpsd.sh
+}
+
 ################################################################################
 # Version Management Commands
 
