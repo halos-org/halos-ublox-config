@@ -16,6 +16,7 @@ Work from the halos workspace repository for full context across all HaLOS repos
 
 ```bash
 ./run lint         # Run shellcheck
+./run test         # Run shellcheck + unit tests
 ./run build-deb    # Build .deb package
 ./run clean        # Remove build artifacts
 ```
@@ -28,6 +29,7 @@ halos-ublox-config/
 │   └── configure-ublox-marine.sh     # Main configuration script
 ├── lib/systemd/system/
 │   └── configure-ublox-marine.service # Systemd service unit
+├── test/                              # Unit tests (shellcheck-clean bash)
 ├── debian/                            # Debian packaging
 └── .github/                           # CI/CD workflows
 ```
@@ -38,7 +40,8 @@ halos-ublox-config/
 2. Script reads UART devices from `/etc/default/gpsd`
 3. For each `/dev/ttyAMA*` device, probes for a u-blox receiver at 115200 then 9600 bps
 4. If found, configures rate, dynamic model, baud rate, and saves to BBR
-5. gpsd then starts with the receiver at the expected 115200 bps
+5. Reconciles `/etc/default/gpsd` so gpsd's `-s` speed matches the receiver (115200), restarting gpsd if it is already running
+6. gpsd then reads the receiver at the expected 115200 bps
 
 ## Version Management
 
@@ -47,7 +50,7 @@ Use `./run bumpversion [patch|minor|major]`. Never edit VERSION or debian/change
 ## CI/CD
 
 Uses shared-workflows for Debian package building:
-- **pr.yml**: PR checks (shellcheck, lintian)
+- **pr.yml**: PR checks (shellcheck, unit tests, lintian)
 - **main.yml**: Builds and publishes to apt.halos.fi unstable on push to main
 - **release.yml**: Publishes to apt.halos.fi stable when release is published
 

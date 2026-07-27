@@ -9,6 +9,7 @@ TARGET_RATE=100      # ms = 10 Hz
 TARGET_MODEL=5       # Sea
 DEFAULT_PROTVER=18
 UBXTOOL_WAIT=2       # seconds
+RC_NO_RECEIVER=2     # configure_device: no receiver found (skip, not a failure)
 
 get_uart_devices() {
     if [ ! -f "$GPSD_DEFAULTS" ]; then
@@ -60,7 +61,7 @@ configure_device() {
 
     if [ -z "$current_baud" ]; then
         echo "No receiver detected on $device — skipping"
-        return 0
+        return "$RC_NO_RECEIVER"
     fi
 
     echo "Receiver responded at ${current_baud} bps"
@@ -90,19 +91,82 @@ configure_device() {
         || { echo "ERROR: SAVE failed"; return 1; }
 
     echo "Successfully configured $device"
+    return 0
+}
+
+# gpsd's baud lives in /etc/default/gpsd, written by pi-gen at image-build time
+# and not otherwise updatable. Keep it in sync with the receiver so a stale image
+# (or a leftover manual workaround) can't leave gpsd opening the port at the wrong
+# baud while this service drives the receiver to TARGET_BAUD.
+reconcile_gpsd_speed() {
+    [ -f "$GPSD_DEFAULTS" ] || return 0
+
+    local current
+    # shellcheck source=/dev/null
+    current=$(. "$GPSD_DEFAULTS" && printf '%s' "${GPSD_OPTIONS:-}")
+
+    case " $current " in
+        *" -s $TARGET_BAUD "*) return 0 ;;
+    esac
+
+    local updated
+    if printf '%s' "$current" | grep -Eq -- '-s [0-9]+'; then
+        updated=$(printf '%s' "$current" | sed -E "s/-s [0-9]+/-s $TARGET_BAUD/")
+    else
+        updated="${current:+$current }-s $TARGET_BAUD"
+    fi
+
+    # Rewrite (or add) the GPSD_OPTIONS line without passing the value through a
+    # sed replacement, so an option string can't corrupt or abort the edit. The
+    # temp-file swap preserves the original file's ownership and permissions, and
+    # the whole step is best-effort: a write failure must not fail the unit that
+    # already configured the receiver.
+    local tmp
+    tmp=$(mktemp) || { echo "WARNING: cannot reconcile gpsd baud (mktemp failed)"; return 0; }
+    { grep -v '^GPSD_OPTIONS=' "$GPSD_DEFAULTS" || true; printf 'GPSD_OPTIONS="%s"\n' "$updated"; } > "$tmp"
+    if ! cat "$tmp" > "$GPSD_DEFAULTS"; then
+        echo "WARNING: cannot write $GPSD_DEFAULTS"
+        rm -f "$tmp"
+        return 0
+    fi
+    rm -f "$tmp"
+    echo "Reconciled gpsd baud to $TARGET_BAUD in $GPSD_DEFAULTS"
+
+    # --no-block: this unit is ordered Before=gpsd.service, so a blocking restart
+    # would deadlock against gpsd's start job on the apt-upgrade path.
+    if systemctl is-active --quiet gpsd.service; then
+        echo "Restarting gpsd to apply new baud..."
+        systemctl --no-block try-restart gpsd.service || true
+    fi
 }
 
 # --- Main ---
 
-uart_devices=$(get_uart_devices)
+main() {
+    local uart_devices configured=0 rc device
+    uart_devices=$(get_uart_devices)
 
-if [ -z "$uart_devices" ]; then
-    echo "No UART GNSS devices configured — nothing to do"
-    exit 0
+    if [ -z "$uart_devices" ]; then
+        echo "No UART GNSS devices configured — nothing to do"
+        return 0
+    fi
+
+    for device in $uart_devices; do
+        if configure_device "$device"; then
+            configured=1
+        else
+            rc=$?
+            [ "$rc" -eq "$RC_NO_RECEIVER" ] || echo "WARNING: Failed to configure $device"
+        fi
+    done
+
+    if [ "$configured" -eq 1 ]; then
+        reconcile_gpsd_speed
+    fi
+
+    echo "u-blox configuration complete"
+}
+
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+    main "$@"
 fi
-
-for device in $uart_devices; do
-    configure_device "$device" || echo "WARNING: Failed to configure $device"
-done
-
-echo "u-blox configuration complete"

@@ -1,9 +1,12 @@
 name: 'Run Tests'
-description: 'Run tests for halos-ublox-config (shellcheck only)'
+description: 'Run tests for halos-ublox-config (shellcheck + unit tests)'
 
 runs:
   using: 'composite'
   steps:
     - name: Run shellcheck
       run: shellcheck usr/libexec/halos/*.sh
+      shell: bash
+    - name: Run unit tests
+      run: bash test/test-reconcile-gpsd.sh
       shell: bash
