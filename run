@@ -49,7 +49,11 @@ function test {
   #@ Run shellcheck and unit tests
   #@ Category: Quality
   lint
-  bash test/test-reconcile-gpsd.sh
+  local suite
+  for suite in test/test-*.sh; do
+    echo "--- $suite"
+    bash "$suite"
+  done
 }
 
 ################################################################################
