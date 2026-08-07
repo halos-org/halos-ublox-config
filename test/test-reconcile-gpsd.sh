@@ -11,13 +11,22 @@ source "$SCRIPT_DIR/../usr/libexec/halos/configure-ublox-marine.sh"
 
 failures=0
 SYSCTL_LOG=$(mktemp)
-SYSCTL_ACTIVE=1   # is-active exit code passed to the stub: 0 = active, 1 = inactive
+SYSCTL_ACTIVE=1   # legacy single-unit knob, used by the reconcile tests below
+SERVICE_ACTIVE=1  # is-active exit codes per unit: 0 = active, 1 = inactive
+SOCKET_ACTIVE=1
 
-# Recording stub: logs every invocation, drives `is-active` via $SYSCTL_ACTIVE.
+# Recording stub. `is-active` answers per unit, not with one global value: the
+# whole point of keying take_port on gpsd.service is that the socket is active
+# on every boot, and a unit-blind stub cannot tell the two apart.
 systemctl() {
     printf '%s\n' "systemctl $*" >> "$SYSCTL_LOG"
     case "$1" in
-        is-active) return "$SYSCTL_ACTIVE" ;;
+        is-active)
+            case "$*" in
+                *gpsd.service*) return "$SERVICE_ACTIVE" ;;
+                *gpsd.socket*)  return "$SOCKET_ACTIVE" ;;
+            esac
+            return "$SYSCTL_ACTIVE" ;;
     esac
     return 0
 }
@@ -60,7 +69,7 @@ fi
 rm -f "$tmp"
 
 # --- reconcile restart branch (the actual self-heal mechanism) ---
-tmp=$(mktemp); : > "$SYSCTL_LOG"; SYSCTL_ACTIVE=0
+tmp=$(mktemp); : > "$SYSCTL_LOG"; SYSCTL_ACTIVE=0; SERVICE_ACTIVE=0
 printf 'GPSD_OPTIONS="-n -s 9600"\n' > "$tmp"
 GPSD_DEFAULTS="$tmp" reconcile_gpsd_speed 115200 >/dev/null
 if grep -q 'try-restart gpsd.service' "$SYSCTL_LOG" && grep -q -- '--no-block' "$SYSCTL_LOG"; then
@@ -71,7 +80,7 @@ fi
 rm -f "$tmp"
 
 # --- idempotent: no rewrite and no restart when already correct ---
-tmp=$(mktemp); : > "$SYSCTL_LOG"; SYSCTL_ACTIVE=0
+tmp=$(mktemp); : > "$SYSCTL_LOG"; SYSCTL_ACTIVE=0; SERVICE_ACTIVE=0
 printf 'GPSD_OPTIONS="-n -s 115200"\n' > "$tmp"
 before=$(cat "$tmp")
 GPSD_DEFAULTS="$tmp" reconcile_gpsd_speed 115200 >/dev/null
@@ -107,15 +116,54 @@ else
 fi
 unset -f ubxtool   # don't let the stub leak into later tests
 
+# --- reconcile replaces the file rather than truncating it ---
+# The target names the device gpsd opens and the devices this script looks for,
+# so a half-written copy costs the GPS permanently and silently. A failed write
+# must therefore leave the original intact, not a truncated remnant.
+tmp=$(mktemp); : > "$SYSCTL_LOG"
+printf 'DEVICES="/dev/ttyAMA0"\nGPSD_OPTIONS="-n -s 9600"\n' > "$tmp"
+chmod 0644 "$tmp"
+before=$(cat "$tmp")
+GPSD_DEFAULTS="$tmp" reconcile_gpsd_speed 115200 >/dev/null
+mode_after=$(ls -l "$tmp" | cut -c1-10)
+if [ "$mode_after" = "-rw-r--r--" ]; then
+    pass "replacement keeps the original file mode"
+else
+    fail "mode changed to $mode_after"
+fi
+
+# Make the rename fail by making the directory unwritable; the original must survive.
+dir=$(mktemp -d); target="$dir/gpsd"
+printf '%s\n' "$before" > "$target"
+chmod 0500 "$dir"
+GPSD_DEFAULTS="$target" reconcile_gpsd_speed 115200 >/dev/null 2>&1 || true
+if [ "$(cat "$target")" = "$before" ]; then
+    pass "a failed write leaves the original file intact"
+else
+    fail "failed write damaged the file: [$(cat "$target")]"
+fi
+chmod 0700 "$dir"; rm -rf "$dir" "$tmp"
+
 # --- main() orchestration ---
 # Stub discovery, per-device configuration, and reconcile so main()'s decisions
 # (which baud gpsd is pointed at, and whether the unit fails) are observable.
 # main() runs in this shell (not a subshell) so the recorded values stick.
-get_uart_devices() { echo "/dev/ttyAMA0"; }
-reconcile_gpsd_speed() { RECONCILE_CALLED=$((RECONCILE_CALLED + 1)); RECONCILE_BAUD="$1"; }
-CONFIGURE_RC=0
-CONFIGURE_BAUD=""
-configure_device() { RECEIVER_BAUD="$CONFIGURE_BAUD"; return "$CONFIGURE_RC"; }
+DEVICE_LIST="/dev/ttyAMA0"
+get_uart_devices() { printf '%s\n' $DEVICE_LIST; }
+# Logged to the same file as systemctl so the ORDER between reconciling the
+# speed and restarting gpsd is observable, not just the fact that both happened.
+# gpsd must never come back before the file it reads has been corrected.
+reconcile_gpsd_speed() {
+    RECONCILE_CALLED=$((RECONCILE_CALLED + 1)); RECONCILE_BAUD="$1"
+    printf 'reconcile %s\n' "$1" >> "$SYSCTL_LOG"
+}
+# Per-device outcome, keyed on the device name: "<rc>:<baud>".
+declare -A DEVICE_RESULT=()
+configure_device() {
+    local spec="${DEVICE_RESULT[$1]:-0:115200}"
+    RECEIVER_BAUD="${spec#*:}"
+    return "${spec%%:*}"
+}
 outfile=$(mktemp)
 
 run_main() {
@@ -125,11 +173,87 @@ run_main() {
     trap - EXIT   # main arms an EXIT trap; don't let it fire in the test shell
 }
 
+SERVICE_ACTIVE=1; SOCKET_ACTIVE=1   # exit codes: 0 = active
+
+DEVICE_LIST="/dev/ttyAMA0"; DEVICE_RESULT=([/dev/ttyAMA0]="0:115200")
+run_main
+if [ "$RECONCILE_CALLED" -eq 1 ] && [ "$RECONCILE_BAUD" = "115200" ] && [ "$MAIN_RC" -eq 0 ]; then
+    pass "main reconciles to the target baud and succeeds after a configured receiver"
+else
+    fail "success path: reconcile=$RECONCILE_CALLED baud=[$RECONCILE_BAUD] rc=$MAIN_RC"
+fi
+
+# The bricking guard: a receiver we detected but could not configure must leave
+# gpsd at the receiver's real baud, so gpsd does not flood it at 115200.
+DEVICE_RESULT=([/dev/ttyAMA0]="1:9600")
+run_main
+if [ "$RECONCILE_CALLED" -eq 1 ] && [ "$RECONCILE_BAUD" = "9600" ] && grep -q WARNING "$outfile"; then
+    pass "main points gpsd at the detected baud when configuration fails"
+else
+    fail "failure path: reconcile=$RECONCILE_CALLED baud=[$RECONCILE_BAUD] out: [$(cat "$outfile")]"
+fi
+if [ "$MAIN_RC" -ne 0 ]; then
+    pass "main exits non-zero when a detected receiver could not be configured"
+else
+    fail "main reported success despite a configuration failure"
+fi
+
+# Nothing to point gpsd at: a failure before the receiver's baud was established
+# must leave the existing setting alone rather than guessing.
+DEVICE_RESULT=([/dev/ttyAMA0]="1:")
+run_main
+if [ "$RECONCILE_CALLED" -eq 0 ] && [ "$MAIN_RC" -ne 0 ]; then
+    pass "main leaves gpsd untouched when no baud was established"
+else
+    fail "unknown-baud path: reconcile=$RECONCILE_CALLED baud=[$RECONCILE_BAUD] rc=$MAIN_RC"
+fi
+
+# Ordering: gpsd's config must be corrected before gpsd is allowed back.
+SERVICE_ACTIVE=0
+DEVICE_RESULT=([/dev/ttyAMA0]="0:115200")
+run_main
+rec_at=$({ grep -n '^reconcile' "$SYSCTL_LOG" || true; } | head -1 | cut -d: -f1)
+start_at=$({ grep -n -- '--no-block start' "$SYSCTL_LOG" || true; } | head -1 | cut -d: -f1)
+if [ -n "$rec_at" ] && [ -n "$start_at" ] && [ "$rec_at" -lt "$start_at" ]; then
+    pass "reconciles the speed before letting gpsd back on the port"
+else
+    fail "ordering wrong (reconcile@${rec_at:-none} start@${start_at:-none})"
+fi
+SERVICE_ACTIVE=1
+
+# Two receivers at different rates cannot both be served by one global -s, so
+# neither may be written: whichever is chosen points gpsd at a rate the other
+# is not using, which is the flood this package exists to prevent.
+DEVICE_LIST="/dev/ttyAMA0 /dev/ttyAMA1"
+DEVICE_RESULT=([/dev/ttyAMA0]="0:115200" [/dev/ttyAMA1]="1:9600")
+run_main
+if [ "$RECONCILE_CALLED" -eq 0 ] && [ "$MAIN_RC" -ne 0 ]; then
+    pass "leaves gpsd untouched when two devices disagree on rate"
+else
+    fail "wrote a global speed for disagreeing devices: baud=[$RECONCILE_BAUD] rc=$MAIN_RC"
+fi
+# Order must not decide the outcome.
+DEVICE_RESULT=([/dev/ttyAMA0]="1:9600" [/dev/ttyAMA1]="0:115200")
+run_main
+if [ "$RECONCILE_CALLED" -eq 0 ]; then
+    pass "device order does not decide which rate gpsd is given"
+else
+    fail "reverse order wrote [$RECONCILE_BAUD]"
+fi
+# Agreeing devices are fine.
+DEVICE_RESULT=([/dev/ttyAMA0]="0:115200" [/dev/ttyAMA1]="0:115200")
+run_main
+if [ "$RECONCILE_CALLED" -eq 1 ] && [ "$RECONCILE_BAUD" = "115200" ] && [ "$MAIN_RC" -eq 0 ]; then
+    pass "writes the shared rate when every device agrees"
+else
+    fail "agreeing devices: reconcile=$RECONCILE_CALLED baud=[$RECONCILE_BAUD] rc=$MAIN_RC"
+fi
+DEVICE_LIST="/dev/ttyAMA0"; DEVICE_RESULT=([/dev/ttyAMA0]="0:115200")
+
 # --- port handover: gpsd owns the device while it runs ---
 # Keyed on gpsd.service alone. The socket is active from early boot on every
 # device and owns no hardware, so keying on it would churn gpsd every boot.
-SYSCTL_ACTIVE=0   # gpsd.service reports active
-CONFIGURE_RC=0; CONFIGURE_BAUD=115200
+SERVICE_ACTIVE=0; SOCKET_ACTIVE=0
 run_main
 if grep -q "^systemctl stop gpsd.socket gpsd.service" "$SYSCTL_LOG"; then
     pass "stops gpsd and its socket when gpsd holds the port"
@@ -142,69 +266,47 @@ else
     fail "did not restart gpsd; log: [$(cat "$SYSCTL_LOG")]"
 fi
 
-# A crash part-way through must not leave the boat without gpsd.
-: > "$SYSCTL_LOG"; SYSCTL_ACTIVE=0; GPSD_STOPPED=0
-take_port >/dev/null
-( trap release_port EXIT; false ) >/dev/null 2>&1 || true
-GPSD_STOPPED=1 release_port >/dev/null
-if grep -q -- "--no-block start" "$SYSCTL_LOG"; then
-    pass "restores gpsd even when the run fails part-way"
-else
-    fail "gpsd left stopped after a failed run; log: [$(cat "$SYSCTL_LOG")]"
-fi
-
-# Boot path: gpsd.service inactive, so nothing should be stopped.
-: > "$SYSCTL_LOG"; SYSCTL_ACTIVE=1; GPSD_STOPPED=0
-CONFIGURE_RC=0; CONFIGURE_BAUD=115200
+# Boot shape: the socket is up but the service is not. Nothing may be stopped,
+# or every boot on every device churns gpsd for no reason.
+SERVICE_ACTIVE=1; SOCKET_ACTIVE=0
 run_main
 if grep -q "systemctl stop" "$SYSCTL_LOG"; then
-    fail "stopped gpsd at boot when it was not holding the port"
+    fail "stopped gpsd at boot when only its socket was active"
 else
-    pass "leaves gpsd alone when it is not running"
-fi
-SYSCTL_ACTIVE=1
-
-CONFIGURE_RC=0; CONFIGURE_BAUD=115200
-run_main
-if [ "$RECONCILE_CALLED" -eq 1 ] && [ "$RECONCILE_BAUD" = "115200" ] && [ "$MAIN_RC" -eq 0 ]; then
-    pass "main reconciles to the target baud and succeeds after a configured receiver"
-else
-    fail "success path: reconcile=$RECONCILE_CALLED baud=[$RECONCILE_BAUD] rc=$MAIN_RC"
+    pass "leaves gpsd alone when only the socket is active"
 fi
 
-CONFIGURE_RC=$RC_NO_RECEIVER; CONFIGURE_BAUD=""
-run_main
-if [ "$RECONCILE_CALLED" -eq 0 ] && [ "$MAIN_RC" -eq 0 ] && ! grep -q WARNING "$outfile"; then
-    pass "main skips reconcile, stays quiet and succeeds when no receiver is present"
+# The restore must survive a run that dies part-way. main's own EXIT trap is the
+# only thing that can do it, so the failure has to happen inside a subshell that
+# main controls -- calling release_port by hand here would prove nothing.
+SERVICE_ACTIVE=0; SOCKET_ACTIVE=0
+: > "$SYSCTL_LOG"; GPSD_STOPPED=0
+( configure_device() { exit 9; }; main ) >/dev/null 2>&1 || true
+if grep -q -- "--no-block start gpsd.socket gpsd.service" "$SYSCTL_LOG"; then
+    pass "restores gpsd when the run dies part-way"
 else
-    fail "no-receiver path: reconcile=$RECONCILE_CALLED rc=$MAIN_RC out: [$(cat "$outfile")]"
+    fail "gpsd left stopped after a fatal error; log: [$(cat "$SYSCTL_LOG")]"
 fi
 
-# The bricking guard: a receiver we detected but could not configure must leave
-# gpsd at the receiver's real baud, so gpsd does not flood it at 115200.
-CONFIGURE_RC=1; CONFIGURE_BAUD=9600
-run_main
-if [ "$RECONCILE_CALLED" -eq 1 ] && [ "$RECONCILE_BAUD" = "9600" ] && grep -q WARNING "$outfile"; then
-    pass "main points gpsd at the detected baud when configuration fails"
+# A stop that reports failure has usually already taken one unit down, so the
+# restore must be armed before the stop, not after it.
+: > "$SYSCTL_LOG"; GPSD_STOPPED=0
+systemctl() {
+    printf '%s\n' "systemctl $*" >> "$SYSCTL_LOG"
+    case "$1" in
+        is-active) case "$*" in *gpsd.service*) return "$SERVICE_ACTIVE";; *gpsd.socket*) return "$SOCKET_ACTIVE";; esac ;;
+        stop) return 1 ;;
+    esac
+    return 0
+}
+take_port >/dev/null 2>&1 || true
+release_port >/dev/null 2>&1 || true
+if grep -q -- "--no-block start" "$SYSCTL_LOG"; then
+    pass "restores gpsd even when the stop reports failure"
 else
-    fail "failure path: reconcile=$RECONCILE_CALLED baud=[$RECONCILE_BAUD] out: [$(cat "$outfile")]"
+    fail "a failed stop left gpsd down; log: [$(cat "$SYSCTL_LOG")]"
 fi
-
-if [ "$MAIN_RC" -ne 0 ]; then
-    pass "main exits non-zero when a detected receiver could not be configured"
-else
-    fail "main reported success despite a configuration failure"
-fi
-
-# Nothing to point gpsd at: a failure before the receiver's baud was established
-# must leave the existing setting alone rather than guessing.
-CONFIGURE_RC=1; CONFIGURE_BAUD=""
-run_main
-if [ "$RECONCILE_CALLED" -eq 0 ] && [ "$MAIN_RC" -ne 0 ]; then
-    pass "main leaves gpsd untouched when no baud was established"
-else
-    fail "unknown-baud path: reconcile=$RECONCILE_CALLED baud=[$RECONCILE_BAUD] rc=$MAIN_RC"
-fi
+GPSD_STOPPED=0
 
 rm -f "$outfile" "$SYSCTL_LOG"
 

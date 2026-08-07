@@ -100,6 +100,64 @@ else
     fail "line noise hid the UART-RX-disabled notice"
 fi
 
+# --- read_port: the only function that touches the device ---
+# Not stubbed here. The property this package exists to guarantee lives in this
+# function, and a stub cannot witness it: a mutation writing to the device inside
+# read_port passed the entire suite before this test existed. Pointing it at a
+# regular file lets the write be detected -- the file's contents must come back
+# unchanged -- while stty and timeout are shadowed so no real tty is needed.
+PORT_FILE=$(mktemp)
+PORT_LOG=$(mktemp)
+printf '%s\n' "$RMC" > "$PORT_FILE"
+PORT_BEFORE=$(cat "$PORT_FILE")
+
+stty() {
+    printf 'stty %s\n' "$*" >> "$PORT_LOG"
+    case "$*" in
+        *speed*) printf '%s\n' "$STTY_SPEED" ;;   # the readback after sampling
+    esac
+}
+timeout() {
+    printf 'timeout %s\n' "$1" >> "$PORT_LOG"
+    shift
+    "$@"
+}
+
+STTY_SPEED=115200
+sample=$(read_port "$PORT_FILE" 115200)
+
+if [ "$(cat "$PORT_FILE")" = "$PORT_BEFORE" ]; then
+    pass "read_port leaves the device untouched"
+else
+    fail "read_port WROTE to the device — the one thing it must never do"
+fi
+if [ "$(grep -c '^timeout' "$PORT_LOG")" -eq 2 ]; then
+    pass "read_port drains before sampling"
+else
+    fail "expected a drain read and a sample read; got: [$(cat "$PORT_LOG")]"
+fi
+if [ "$(grep -c "^timeout $SNIFF_FLUSH\$" "$PORT_LOG")" -eq 1 ]; then
+    pass "the drain uses the short flush window"
+else
+    fail "drain window wrong: [$(cat "$PORT_LOG")]"
+fi
+case "$sample" in
+    *"$RMC"*) pass "read_port returns what the device emitted" ;;
+    *) fail "sample did not contain the device's output: [$sample]" ;;
+esac
+
+# A rate that changed under us means the sample was framed by someone else's
+# termios, so it must not be credited to the rate we asked for.
+STTY_SPEED=9600
+if read_port "$PORT_FILE" 115200 >/dev/null; then
+    fail "accepted a sample after the port rate changed mid-listen"
+else
+    pass "rejects a sample whose port rate changed mid-listen"
+fi
+STTY_SPEED=115200
+unset -f stty timeout
+rm -f "$PORT_FILE" "$PORT_LOG"
+
 # --- detect_baud: listens only, and reports where the receiver actually is ---
 READ_LOG=$(mktemp)
 # Canned port: $SAMPLE_115200 / $SAMPLE_9600 decide what each baud yields.
@@ -154,78 +212,119 @@ else
     fail "did not flag the RX-disabled receiver"
 fi
 
-# --- configure_device: nothing is transmitted before the baud is known ---
-UBX_LOG=$(mktemp)
-ubxtool() { printf '%s\n' "ubxtool $*" >> "$UBX_LOG"; printf 'UBX-MON-VER:\n  PROTVER=18\n'; }
-
-# No receiver anywhere: the script must stay silent on the wire.
-: > "$UBX_LOG"; SAMPLE_115200="$GARBAGE"; SAMPLE_9600="$GARBAGE"
-rc=0; configure_device /dev/ttyAMA0 >/dev/null 2>&1 || rc=$?
-if [ "$rc" -eq "$RC_NO_RECEIVER" ] && [ ! -s "$UBX_LOG" ]; then
-    pass "undetected receiver: returns no-receiver and transmits nothing"
-else
-    fail "undetected receiver: rc=$rc, transmitted: [$(cat "$UBX_LOG")]"
-fi
-
-# RX already disabled: reconfiguration is impossible, so do not add to the flood.
-: > "$UBX_LOG"; SAMPLE_115200="$GARBAGE"; SAMPLE_9600="$RXOFF"
-rc=0; configure_device /dev/ttyAMA0 >/dev/null 2>&1 || rc=$?
-if [ "$rc" -eq 1 ] && [ ! -s "$UBX_LOG" ] && [ "$RECEIVER_BAUD" = "9600" ]; then
-    pass "RX-disabled receiver: fails, transmits nothing, reports its real baud"
-else
-    fail "RX-disabled receiver: rc=$rc baud=[${RECEIVER_BAUD:-}] transmitted: [$(cat "$UBX_LOG")]"
-fi
-
-# Every transmission must name the detected baud, never the other candidate.
-: > "$UBX_LOG"; SAMPLE_115200="$GARBAGE"; SAMPLE_9600="$RMC"
-configure_device /dev/ttyAMA0 >/dev/null 2>&1 || true
-if grep -q -- "-s 115200" "$UBX_LOG" && ! grep -q -- "-s 9600" "$UBX_LOG"; then
-    fail "transmitted at 115200 to a receiver detected at 9600: [$(cat "$UBX_LOG")]"
-else
-    pass "addresses the receiver at its detected baud"
-fi
-
-# --- configure_device: order of operations, and the stranded-receiver path ---
-# A receiver at 10 Hz on 9600 overruns its transmit buffer and drops poll
-# replies while still accepting commands. Setting the rate before raising the
-# baud is what puts it there, so the baud has to move first.
-SILENT_BELOW_TARGET=0
-ubxtool() {
-    printf '%s\n' "ubxtool $*" >> "$UBX_LOG"
-    case "$*" in
-        *"-S 115200"*)   # the switch lands: the receiver reappears at 115200
-            SAMPLE_115200="$RMC"; SAMPLE_9600="$GARBAGE"; SILENT_BELOW_TARGET=0 ;;
-    esac
-    if [ "$SILENT_BELOW_TARGET" -eq 1 ]; then
-        return 0        # command accepted, no reply -- the oversubscribed case
-    fi
-    printf 'UBX-MON-VER:\n  PROTVER=18\n'
-}
-
 # Line number of the first matching call, empty if never called. grep returning
 # 1 must not abort the suite, so it is guarded before the pipe.
 order_of() { { grep -n -e "$1" "$UBX_LOG" || true; } | head -1 | cut -d: -f1; }
 
-: > "$UBX_LOG"; SAMPLE_115200="$GARBAGE"; SAMPLE_9600="$RMC"; SILENT_BELOW_TARGET=0
+# --- configure_device against a simulated receiver ---
+# One receiver with a real current rate, held in a file because probe_receiver
+# runs ubxtool inside a command substitution and a subshell's variable writes are
+# lost. Every ubxtool call is checked against that rate, so "transmitted at a
+# rate the receiver is not running at" is caught mechanically instead of by an
+# assertion someone has to remember to write. That is the whole safety property.
+UBX_LOG=$(mktemp)
+MISMATCH_LOG=$(mktemp)
+RATE_FILE=$(mktemp)
+
+arg_after() {   # arg_after <flag> <args...>
+    local want="$1" prev=""; shift
+    for a in "$@"; do
+        [ "$prev" = "$want" ] && { printf '%s' "$a"; return 0; }
+        prev="$a"
+    done
+    return 1
+}
+
+STUB_PROTVER=27          # deliberately != DEFAULT_PROTVER so the two are distinguishable
+STUB_SILENT_BELOW_TARGET=0
+STUB_FAIL_ON=""
+
+ubxtool() {
+    printf 'ubxtool %s\n' "$*" >> "$UBX_LOG"
+    local addressed actual
+    addressed=$(arg_after -s "$@") || addressed=""
+    actual=$(cat "$RATE_FILE")
+
+    if [ -n "$addressed" ] && [ "$addressed" != "$actual" ]; then
+        printf 'addressed %s while receiver at %s: %s\n' "$addressed" "$actual" "$*" >> "$MISMATCH_LOG"
+        return 0        # a receiver that cannot hear us simply says nothing
+    fi
+    if [ -n "$STUB_FAIL_ON" ]; then
+        case "$*" in *"$STUB_FAIL_ON"*) return 1 ;; esac
+    fi
+    # A set command lands even when polls get no reply.
+    local newrate
+    newrate=$(arg_after -S "$@") && printf '%s' "$newrate" > "$RATE_FILE"
+
+    if [ "$STUB_SILENT_BELOW_TARGET" -eq 1 ] && [ "$actual" != "$TARGET_BAUD" ]; then
+        return 0        # oversubscribed link: command lands, reply is dropped
+    fi
+    printf 'UBX-MON-VER:\n  PROTVER=%s\n' "$STUB_PROTVER"
+}
+
+read_port() {
+    printf 'read_port %s %s\n' "$1" "$2" >> "$READ_LOG"
+    local actual; actual=$(cat "$RATE_FILE")
+    if [ "$2" = "$actual" ]; then printf '%s' "$RECEIVER_SAMPLE"; else printf '%s' "$GARBAGE"; fi
+}
+
+start_receiver() {      # start_receiver <rate> [sample]
+    printf '%s' "$1" > "$RATE_FILE"
+    RECEIVER_SAMPLE="${2:-$RMC}"
+    : > "$UBX_LOG"; : > "$MISMATCH_LOG"; : > "$READ_LOG"
+    RECEIVER_BAUD=""
+    STUB_FAIL_ON=""; STUB_SILENT_BELOW_TARGET=0
+}
+
+no_mismatch() {         # the safety property, asserted after every case
+    if [ -s "$MISMATCH_LOG" ]; then
+        fail "$1 — TRANSMITTED AT THE WRONG RATE: [$(cat "$MISMATCH_LOG")]"
+    else
+        pass "$1"
+    fi
+}
+
+# Already at the target rate.
+start_receiver "$TARGET_BAUD"
 rc=0; configure_device /dev/ttyAMA0 >/dev/null 2>&1 || rc=$?
-baud_at=$(order_of "\-S 115200"); rate_at=$(order_of "CFG-RATE")
-if [ "$rc" -eq 0 ] && [ -n "$baud_at" ] && [ -n "$rate_at" ] && [ "$baud_at" -lt "$rate_at" ]; then
-    pass "raises the baud before setting the rate"
+[ "$rc" -eq 0 ] || fail "configured receiver: rc=$rc"
+no_mismatch "never addresses the wrong rate on an already-configured receiver"
+if grep -q -- "-P $STUB_PROTVER" "$UBX_LOG"; then
+    pass "uses the protocol version the receiver reported"
 else
-    fail "ordering wrong (rc=$rc baud@${baud_at:-none} rate@${rate_at:-none})"
+    fail "did not use the reported protocol version: [$(cat "$UBX_LOG")]"
 fi
 
-# Stranded at 9600 and answering nothing: recover it rather than giving up.
-: > "$UBX_LOG"; SAMPLE_115200="$GARBAGE"; SAMPLE_9600="$RMC"; SILENT_BELOW_TARGET=1
+# Factory rate: must move up, and every command must track the receiver.
+start_receiver "$FACTORY_BAUD"
 rc=0; configure_device /dev/ttyAMA0 >/dev/null 2>&1 || rc=$?
-if [ "$rc" -eq 0 ] && grep -q -- "-S 115200" "$UBX_LOG"; then
-    pass "moves a silent below-target receiver up instead of aborting"
+[ "$rc" -eq 0 ] || fail "factory receiver: rc=$rc"
+no_mismatch "never addresses the wrong rate while moving a 9600 receiver up"
+if [ "$(cat "$RATE_FILE")" = "$TARGET_BAUD" ]; then
+    pass "leaves the receiver at the target rate"
 else
-    fail "gave up on a recoverable stranded receiver (rc=$rc): [$(cat "$UBX_LOG")]"
+    fail "receiver ended at $(cat "$RATE_FILE")"
+fi
+baud_at=$(order_of "\-S $TARGET_BAUD"); rate_at=$(order_of "CFG-RATE")
+if [ -n "$baud_at" ] && [ -n "$rate_at" ] && [ "$baud_at" -lt "$rate_at" ]; then
+    pass "raises the rate before setting 10 Hz"
+else
+    fail "ordering wrong (baud@${baud_at:-none} rate@${rate_at:-none})"
 fi
 
-# Silent at the target rate is a genuine fault: no bandwidth excuse there.
-: > "$UBX_LOG"; SAMPLE_115200="$RMC"; SAMPLE_9600="$GARBAGE"; SILENT_BELOW_TARGET=1
+# Stranded at 9600 answering no polls: recover, still without a wrong-rate write.
+start_receiver "$FACTORY_BAUD"; STUB_SILENT_BELOW_TARGET=1
+rc=0; configure_device /dev/ttyAMA0 >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 0 ] || fail "stranded receiver: rc=$rc"
+no_mismatch "never addresses the wrong rate recovering a silent 9600 receiver"
+if grep -q -- "-P $DEFAULT_PROTVER" "$UBX_LOG" && grep -q -- "-P $STUB_PROTVER" "$UBX_LOG"; then
+    pass "assumes the default protocol below target, then re-reads it above"
+else
+    fail "protocol fallback not exercised: [$(cat "$UBX_LOG")]"
+fi
+
+# Silent at the target rate is a real fault.
+start_receiver "$TARGET_BAUD"; STUB_FAIL_ON="MON-VER"
 rc=0; configure_device /dev/ttyAMA0 >/dev/null 2>&1 || rc=$?
 if [ "$rc" -eq 1 ] && ! grep -q "CFG-RATE" "$UBX_LOG"; then
     pass "fails on a receiver that is silent at the target rate"
@@ -233,8 +332,56 @@ else
     fail "did not fail on a silent target-rate receiver (rc=$rc): [$(cat "$UBX_LOG")]"
 fi
 
-rm -f "$READ_LOG" "$UBX_LOG"
-unset -f read_port ubxtool
+# Each ubxtool failure branch must abort the run and stop later steps.
+for step in "-S $TARGET_BAUD" "CFG-RATE" "MODEL" "SAVE"; do
+    start_receiver "$FACTORY_BAUD"; STUB_FAIL_ON="$step"
+    rc=0; configure_device /dev/ttyAMA0 >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -eq 1 ]; then
+        pass "aborts when $step fails"
+    else
+        fail "$step failure did not abort (rc=$rc): [$(cat "$UBX_LOG")]"
+    fi
+    no_mismatch "no wrong-rate write when $step fails"
+done
+
+# A receiver that vanishes after the switch: its rate is unknown, so nothing may
+# be asserted about it. Guessing the pre-switch rate would point gpsd at the one
+# rate the receiver is known to have left.
+start_receiver "$FACTORY_BAUD"
+_rp_saved=$(declare -f read_port)
+read_port() {
+    printf 'read_port %s %s\n' "$1" "$2" >> "$READ_LOG"
+    # Answers at 9600 until the switch lands, then nothing at either rate.
+    if [ "$(cat "$RATE_FILE")" = "$FACTORY_BAUD" ] && [ "$2" = "$FACTORY_BAUD" ]; then
+        printf '%s' "$RMC"
+    else
+        printf '%s' "$GARBAGE"
+    fi
+}
+rc=0; configure_device /dev/ttyAMA0 >/dev/null 2>&1 || rc=$?
+if [ "$rc" -eq 1 ] && [ -z "$RECEIVER_BAUD" ]; then
+    pass "reports an unknown rate when the receiver vanishes after the switch"
+else
+    fail "guessed a rate after the switch (rc=$rc baud=[${RECEIVER_BAUD:-}])"
+fi
+eval "$_rp_saved"
+
+# A device listed in DEVICES that says nothing is a fault, not an absence.
+start_receiver 4800    # neither candidate rate
+rc=0; configure_device /dev/ttyAMA0 >/dev/null 2>&1 || rc=$?
+if [ "$rc" -eq 1 ] && [ ! -s "$UBX_LOG" ] && [ -z "$RECEIVER_BAUD" ]; then
+    pass "unheard device fails the unit and transmits nothing"
+else
+    fail "unheard device: rc=$rc transmitted [$(cat "$UBX_LOG")]"
+fi
+if [ "$(grep -c '^read_port' "$READ_LOG")" -eq $((DETECT_RETRIES * 2)) ]; then
+    pass "retries detection before declaring a device silent"
+else
+    fail "expected $((DETECT_RETRIES * 2)) listens, got: [$(cat "$READ_LOG")]"
+fi
+
+rm -f "$READ_LOG" "$UBX_LOG" "$MISMATCH_LOG" "$RATE_FILE"
+unset -f read_port ubxtool arg_after
 
 if [ "$failures" -ne 0 ]; then
     echo "$failures test(s) failed"
