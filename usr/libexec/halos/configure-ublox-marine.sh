@@ -60,18 +60,35 @@ valid_nmea_line() {
     [ "$sum" -eq "$expected" ]
 }
 
+# NMEA 0183 is 7-bit ASCII, so every other byte in a sample is noise by
+# definition -- and leaving it in corrupts the text operations themselves. Under
+# glibc in a UTF-8 locale, `read` treats a stray high byte as the start of a
+# multi-byte character and consumes the newline that follows it, so a valid
+# sentence preceded by line noise gets merged into the noise line and is never
+# seen. That is not hypothetical here: the re-listen after a baud switch reads
+# the tail of the old rate as high-bit garbage, immediately followed by clean
+# sentences at the new one.
+#
+# LC_ALL=C because this is a byte filter fed deliberately invalid text: BSD tr
+# aborts with "Illegal byte sequence" in a UTF-8 locale. The trailing newline is
+# required, not cosmetic -- read discards a final line that is not
+# newline-terminated, and a sample can end mid-sentence.
+ascii_only() {
+    printf '%s\n' "$1" | LC_ALL=C tr -cd '\11\12\15\40-\176'
+}
+
 has_valid_nmea() {
     local line
     while IFS= read -r line; do
         valid_nmea_line "$line" && return 0
-    done <<< "$1"
+    done < <(ascii_only "$1")
     return 1
 }
 
 # The receiver announces this state itself, in a normal NMEA sentence, and keeps
 # transmitting afterwards -- so it is visible exactly where a passive read looks.
 rx_disabled() {
-    [[ "$1" == *"UART RX was disabled"* ]]
+    [[ "$(ascii_only "$1")" == *"UART RX was disabled"* ]]
 }
 
 detect_baud() {

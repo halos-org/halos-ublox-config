@@ -22,8 +22,13 @@ fail() { echo "FAIL - $1"; failures=$((failures + 1)); }
 GGA='$GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47'
 RMC='$GNRMC,120000.00,A,5956.94000,N,02407.68000,E,0.5,180.0,070826,,,A*49'
 RXOFF='$GNTXT,01,01,01,More than 100 frame errors, UART RX was disabled*70'
-# What a 9600 receiver looks like when the port is opened at 115200.
-GARBAGE=$'\xfe\xf8\x00\xc0\x1f\xe0$\x03\xff\xfc\x80\x7f\xf0\x01\xe0'
+# What a 9600 receiver looks like when the port is opened at 115200. No NUL:
+# bash drops those at different points on different libcs, so leaving one here
+# makes the fixture mean something different per platform. Real samples never
+# carry one this far anyway -- command substitution strips them. The high bytes
+# are the load-bearing part: they are invalid UTF-8, which is what breaks
+# line splitting under glibc.
+GARBAGE=$'\xfe\xf8\xc0\x1f\xe0$\x03\xff\xfc\x80\x7f\xf0\x01\xe0'
 
 # --- valid_nmea_line: checksum is the discriminator ---
 if valid_nmea_line "$GGA"; then pass "accepts a sentence with a correct checksum"; else fail "rejected a valid GGA"; fi
@@ -41,12 +46,26 @@ else
     fail "missed a valid sentence surrounded by noise"
 fi
 if has_valid_nmea "$(printf '%s\r\n' "$RMC")"; then pass "tolerates CRLF line endings"; else fail "CRLF sentence not recognised"; fi
+# Regression: glibc's read consumes the newline after an invalid UTF-8 byte, so
+# a sentence directly behind such noise used to vanish into the noise line. This
+# is the shape the re-listen after a baud switch actually produces.
+if has_valid_nmea "$(printf '\xfe\xf8%s\n%s\n' "" "$RMC")"; then
+    pass "finds a sentence on the line after an invalid UTF-8 byte"
+else
+    fail "invalid UTF-8 byte swallowed the newline before a valid sentence"
+fi
 if has_valid_nmea "$GARBAGE"; then fail "reported NMEA in a pure-noise sample"; else pass "reports no NMEA in a pure-noise sample"; fi
 if has_valid_nmea ""; then fail "reported NMEA in an empty sample"; else pass "reports no NMEA in an empty sample"; fi
 
 # --- rx_disabled ---
 if rx_disabled "$RXOFF"; then pass "detects the UART-RX-disabled notice"; else fail "missed the UART-RX-disabled notice"; fi
 if rx_disabled "$GGA"; then fail "false positive on a normal sentence"; else pass "no false positive on a normal sentence"; fi
+# The notice reaches us mid-stream, so noise ahead of it must not hide it.
+if rx_disabled "$GARBAGE"$'\n'"$RXOFF"; then
+    pass "detects the notice behind line noise"
+else
+    fail "line noise hid the UART-RX-disabled notice"
+fi
 
 # --- detect_baud: listens only, and reports where the receiver actually is ---
 READ_LOG=$(mktemp)
