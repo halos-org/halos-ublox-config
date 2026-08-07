@@ -18,9 +18,18 @@ ROM-based u-blox modules (such as the MAX-M8Q on HALPI2) have no flash memory. C
 
 1. `configure-ublox-marine.service` runs before `gpsd.service` on every boot
 2. Reads UART devices from `/etc/default/gpsd`
-3. Probes each `/dev/ttyAMA*` device for a u-blox receiver (115200 then 9600 bps)
-4. Configures rate, dynamic model, and baud rate via `ubxtool`
+3. Listens to each `/dev/ttyAMA*` device at 115200 then 9600 bps, accepting the rate that yields a checksum-valid NMEA sentence
+4. Configures rate, dynamic model, and baud rate via `ubxtool`, at the detected rate
 5. Saves settings to BBR (persists until next power loss)
+6. Points gpsd's `-s` speed at the receiver's actual baud
+
+## Why detection is read-only
+
+Transmitting UBX at a baud the receiver is not running at produces framing errors, and u-blox M8 firmware disables its UART receiver after more than 100 of them. The module keeps transmitting NMEA, so it still looks alive, but it accepts no further configuration — and HALPI2 has no GNSS reset line, so only fully removing power clears the state.
+
+Detection therefore transmits nothing. The receiver streams NMEA continuously at whatever rate it is currently running, so the baud can be established by listening, and UBX only goes out once the rate is known. A receiver that has already latched into the RX-disabled state announces it in a `$GNTXT` sentence, which the same read picks up and reports.
+
+The corollary is that a receiver configured for UBX-only output cannot be detected. Nothing in HaLOS produces that state — factory default and this package both leave NMEA enabled — and probing for it would mean transmitting blind, which is the hazard above.
 
 ## Part of HaLOS
 
