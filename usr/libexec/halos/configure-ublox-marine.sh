@@ -9,7 +9,15 @@ TARGET_RATE=100      # ms = 10 Hz
 TARGET_MODEL=5       # Sea
 DEFAULT_PROTVER=18
 UBXTOOL_WAIT=2       # seconds
+SNIFF_SECONDS=3      # passive listen window per candidate baud
 RC_NO_RECEIVER=2     # configure_device: no receiver found (skip, not a failure)
+
+# Set by detect_baud.
+DETECTED_BAUD=""
+DETECTED_RX_DISABLED=0
+# Where configure_device last saw a receiver, even if configuring it failed.
+# main uses this to keep gpsd's speed matched to the hardware's actual state.
+RECEIVER_BAUD=""
 
 get_uart_devices() {
     if [ ! -f "$GPSD_DEFAULTS" ]; then
@@ -24,6 +32,65 @@ get_uart_devices() {
             /dev/ttyAMA*) echo "$dev" ;;
         esac
     done
+}
+
+# Listen to the port without transmitting. Transmitting at a baud the receiver
+# is not running at produces framing errors, and M8 firmware disables its UART
+# receiver after more than 100 of them; HALPI2 has no GNSS reset line, so that
+# state survives a warm reboot. Detection therefore has to be read-only.
+read_port() {
+    local device="$1" baud="$2"
+    stty -F "$device" "$baud" raw -echo -hupcl clocal 2>/dev/null || return 1
+    # cat writes each read through unbuffered, so the sample collected before
+    # timeout kills it still reaches the caller. 124 (timed out) is the norm.
+    timeout "$SNIFF_SECONDS" cat "$device" 2>/dev/null || true
+}
+
+# A valid checksum is what separates NMEA from the line noise a mismatched baud
+# produces; a bare '$' appearing in noise is not enough to accept a rate.
+valid_nmea_line() {
+    local line="${1%$'\r'}" body expected sum=0 i char
+    [[ "$line" =~ ^\$([A-Za-z0-9]+,[^*]*)\*([0-9A-Fa-f]{2})$ ]] || return 1
+    body="${BASH_REMATCH[1]}"
+    expected=$((16#${BASH_REMATCH[2]}))
+    for ((i = 0; i < ${#body}; i++)); do
+        printf -v char '%d' "'${body:i:1}"
+        sum=$((sum ^ char))
+    done
+    [ "$sum" -eq "$expected" ]
+}
+
+has_valid_nmea() {
+    local line
+    while IFS= read -r line; do
+        valid_nmea_line "$line" && return 0
+    done <<< "$1"
+    return 1
+}
+
+# The receiver announces this state itself, in a normal NMEA sentence, and keeps
+# transmitting afterwards -- so it is visible exactly where a passive read looks.
+rx_disabled() {
+    [[ "$1" == *"UART RX was disabled"* ]]
+}
+
+detect_baud() {
+    local device="$1" baud sample
+    DETECTED_BAUD=""
+    DETECTED_RX_DISABLED=0
+
+    # Target first: an already-configured receiver is the common case, and
+    # ordering only costs a listen window, never a mismatched transmission.
+    for baud in "$TARGET_BAUD" "$FACTORY_BAUD"; do
+        sample=$(read_port "$device" "$baud") || continue
+        has_valid_nmea "$sample" || continue
+        DETECTED_BAUD="$baud"
+        if rx_disabled "$sample"; then
+            DETECTED_RX_DISABLED=1
+        fi
+        return 0
+    done
+    return 1
 }
 
 probe_receiver() {
@@ -53,21 +120,28 @@ configure_device() {
     local device="$1"
     echo "Configuring $device..."
 
-    # Probe: try target baud first (already configured?), then factory
-    local mon_ver="" current_baud=""
-    for baud in "$TARGET_BAUD" "$FACTORY_BAUD"; do
-        if mon_ver=$(probe_receiver "$device" "$baud"); then
-            current_baud="$baud"
-            break
-        fi
-    done
-
-    if [ -z "$current_baud" ]; then
+    RECEIVER_BAUD=""
+    if ! detect_baud "$device"; then
         echo "No receiver detected on $device — skipping"
         return "$RC_NO_RECEIVER"
     fi
 
-    echo "Receiver responded at ${current_baud} bps"
+    local current_baud="$DETECTED_BAUD"
+    RECEIVER_BAUD="$current_baud"
+    echo "Receiver streaming NMEA at ${current_baud} bps"
+
+    if [ "$DETECTED_RX_DISABLED" -eq 1 ]; then
+        echo "ERROR: receiver reports its UART RX disabled after excessive frame errors."
+        echo "       It cannot be reconfigured until power is fully removed — a warm"
+        echo "       reboot will not clear it. Leaving gpsd at ${current_baud} bps."
+        return 1
+    fi
+
+    local mon_ver
+    if ! mon_ver=$(probe_receiver "$device" "$current_baud"); then
+        echo "ERROR: no UBX response at ${current_baud} bps despite valid NMEA"
+        return 1
+    fi
 
     local protver
     protver=$(parse_protver "$mon_ver")
@@ -85,8 +159,18 @@ configure_device() {
         echo "Changing baud rate to $TARGET_BAUD..."
         run_ubxtool "$device" "$current_baud" "$protver" -S "$TARGET_BAUD" \
             || { echo "ERROR: baud change failed"; return 1; }
-        current_baud="$TARGET_BAUD"
         sleep 1
+
+        # Confirm where the receiver actually ended up rather than assuming the
+        # switch took. Listening again is read-only, so a receiver that stayed
+        # behind is found without transmitting at the rate it rejected.
+        if ! detect_baud "$device" || [ "$DETECTED_BAUD" -ne "$TARGET_BAUD" ]; then
+            RECEIVER_BAUD="${DETECTED_BAUD:-$current_baud}"
+            echo "ERROR: receiver did not switch to $TARGET_BAUD (now at ${RECEIVER_BAUD} bps)"
+            return 1
+        fi
+        current_baud="$TARGET_BAUD"
+        RECEIVER_BAUD="$current_baud"
     fi
 
     echo "Saving to BBR..."
@@ -118,7 +202,6 @@ reconcile_gpsd_speed() {
     else
         updated="${current:+$current }-s $TARGET_BAUD"
     fi
-
     # Rewrite (or add) the GPSD_OPTIONS line without passing the value through a
     # sed replacement, so an option string can't corrupt or abort the edit. The
     # temp-file swap preserves the original file's ownership and permissions, and
