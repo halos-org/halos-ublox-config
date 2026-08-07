@@ -53,7 +53,12 @@ read_port() {
     timeout "$SNIFF_FLUSH" cat "$device" >/dev/null 2>&1 || true
     # cat writes each read through unbuffered, so the sample collected before
     # timeout kills it still reaches the caller. 124 (timed out) is the norm.
-    timeout "$SNIFF_SECONDS" cat "$device" 2>/dev/null || true
+    #
+    # Dropping NULs changes nothing about the sample -- the command substitution
+    # that captures it discards them regardless -- but doing it here keeps bash
+    # from logging "ignored null byte in input" on every read. UBX binary is full
+    # of them, so that is one warning per baud per boot on a healthy device.
+    timeout "$SNIFF_SECONDS" cat "$device" 2>/dev/null | LC_ALL=C tr -d '\000' || true
 }
 
 # A valid checksum is what separates NMEA from the line noise a mismatched baud
@@ -168,10 +173,15 @@ parse_protver() {
     echo "${ver:-$DEFAULT_PROTVER}"
 }
 
+# Output discarded, not just stderr: while ubxtool waits it prints every UBX
+# message the receiver sends, which is hundreds of lines per invocation. No
+# caller reads it (only probe_receiver's output is parsed), and burying this
+# unit's own messages under that volume is part of why the failure in #5 went
+# unnoticed until the journal had rotated.
 run_ubxtool() {
     local device="$1" baud="$2" protver="$3"
     shift 3
-    ubxtool -f "$device" -s "$baud" -P "$protver" -w "$UBXTOOL_WAIT" "$@" 2>/dev/null
+    ubxtool -f "$device" -s "$baud" -P "$protver" -w "$UBXTOOL_WAIT" "$@" >/dev/null 2>&1
 }
 
 configure_device() {
