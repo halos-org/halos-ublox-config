@@ -35,7 +35,7 @@ check_reconcile() {
     tmp=$(mktemp)
     printf '%b' "$body" > "$tmp"
     SYSCTL_ACTIVE=1
-    GPSD_DEFAULTS="$tmp" reconcile_gpsd_speed >/dev/null
+    GPSD_DEFAULTS="$tmp" reconcile_gpsd_speed 115200 >/dev/null
     actual=$(read_options "$tmp")
     if [ "$actual" = "$expected" ]; then pass "$desc"; else fail "$desc: expected [$expected] got [$actual]"; fi
     rm -f "$tmp"
@@ -51,7 +51,7 @@ check_reconcile "adds GPSD_OPTIONS when the line is absent entirely" 'DEVICES="/
 tmp=$(mktemp)
 printf 'DEVICES="/dev/ttyAMA0"\nGPSD_OPTIONS="-n -s 9600"\nUSBAUTO=true\n' > "$tmp"
 SYSCTL_ACTIVE=1
-GPSD_DEFAULTS="$tmp" reconcile_gpsd_speed >/dev/null
+GPSD_DEFAULTS="$tmp" reconcile_gpsd_speed 115200 >/dev/null
 if grep -q '^DEVICES="/dev/ttyAMA0"$' "$tmp" && grep -q '^USBAUTO=true$' "$tmp"; then
     pass "preserves DEVICES and USBAUTO lines"
 else
@@ -62,7 +62,7 @@ rm -f "$tmp"
 # --- reconcile restart branch (the actual self-heal mechanism) ---
 tmp=$(mktemp); : > "$SYSCTL_LOG"; SYSCTL_ACTIVE=0
 printf 'GPSD_OPTIONS="-n -s 9600"\n' > "$tmp"
-GPSD_DEFAULTS="$tmp" reconcile_gpsd_speed >/dev/null
+GPSD_DEFAULTS="$tmp" reconcile_gpsd_speed 115200 >/dev/null
 if grep -q 'try-restart gpsd.service' "$SYSCTL_LOG" && grep -q -- '--no-block' "$SYSCTL_LOG"; then
     pass "restarts gpsd non-blocking when active and the file changed"
 else
@@ -74,7 +74,7 @@ rm -f "$tmp"
 tmp=$(mktemp); : > "$SYSCTL_LOG"; SYSCTL_ACTIVE=0
 printf 'GPSD_OPTIONS="-n -s 115200"\n' > "$tmp"
 before=$(cat "$tmp")
-GPSD_DEFAULTS="$tmp" reconcile_gpsd_speed >/dev/null
+GPSD_DEFAULTS="$tmp" reconcile_gpsd_speed 115200 >/dev/null
 if [ "$(cat "$tmp")" = "$before" ] && [ ! -s "$SYSCTL_LOG" ]; then
     pass "no file rewrite and no gpsd restart when already correct"
 else
@@ -84,7 +84,7 @@ rm -f "$tmp"
 
 # --- missing file is a no-op success ---
 : > "$SYSCTL_LOG"
-if GPSD_DEFAULTS="/nonexistent/gpsd-$$" reconcile_gpsd_speed >/dev/null; then
+if GPSD_DEFAULTS="/nonexistent/gpsd-$$" reconcile_gpsd_speed 115200 >/dev/null; then
     pass "missing defaults file is a no-op"
 else
     fail "missing defaults file returned non-zero"
@@ -109,32 +109,60 @@ unset -f ubxtool   # don't let the stub leak into later tests
 
 # --- main() orchestration ---
 # Stub discovery, per-device configuration, and reconcile so main()'s decisions
-# (reconcile only after a configured receiver; warn only on genuine failure) are
-# observable. main() runs in this shell (not a subshell) so RECONCILE_CALLED sticks.
+# (which baud gpsd is pointed at, and whether the unit fails) are observable.
+# main() runs in this shell (not a subshell) so the recorded values stick.
 get_uart_devices() { echo "/dev/ttyAMA0"; }
-reconcile_gpsd_speed() { RECONCILE_CALLED=$((RECONCILE_CALLED + 1)); }
+reconcile_gpsd_speed() { RECONCILE_CALLED=$((RECONCILE_CALLED + 1)); RECONCILE_BAUD="$1"; }
 CONFIGURE_RC=0
-configure_device() { return "$CONFIGURE_RC"; }
+CONFIGURE_BAUD=""
+configure_device() { RECEIVER_BAUD="$CONFIGURE_BAUD"; return "$CONFIGURE_RC"; }
 outfile=$(mktemp)
 
-RECONCILE_CALLED=0; CONFIGURE_RC=0
-main > "$outfile" 2>&1 || true
-if [ "$RECONCILE_CALLED" -eq 1 ]; then pass "main reconciles after a configured receiver"; else fail "main did not reconcile on success"; fi
+run_main() {
+    RECONCILE_CALLED=0; RECONCILE_BAUD=""; MAIN_RC=0
+    main > "$outfile" 2>&1 || MAIN_RC=$?
+}
 
-RECONCILE_CALLED=0; CONFIGURE_RC=$RC_NO_RECEIVER
-main > "$outfile" 2>&1 || true
-if [ "$RECONCILE_CALLED" -eq 0 ] && ! grep -q WARNING "$outfile"; then
-    pass "main skips reconcile and stays quiet when no receiver is present"
+CONFIGURE_RC=0; CONFIGURE_BAUD=115200
+run_main
+if [ "$RECONCILE_CALLED" -eq 1 ] && [ "$RECONCILE_BAUD" = "115200" ] && [ "$MAIN_RC" -eq 0 ]; then
+    pass "main reconciles to the target baud and succeeds after a configured receiver"
 else
-    fail "main mishandled the no-receiver path; out: [$(cat "$outfile")]"
+    fail "success path: reconcile=$RECONCILE_CALLED baud=[$RECONCILE_BAUD] rc=$MAIN_RC"
 fi
 
-RECONCILE_CALLED=0; CONFIGURE_RC=1
-main > "$outfile" 2>&1 || true
-if [ "$RECONCILE_CALLED" -eq 0 ] && grep -q WARNING "$outfile"; then
-    pass "main warns and skips reconcile on a configuration failure"
+CONFIGURE_RC=$RC_NO_RECEIVER; CONFIGURE_BAUD=""
+run_main
+if [ "$RECONCILE_CALLED" -eq 0 ] && [ "$MAIN_RC" -eq 0 ] && ! grep -q WARNING "$outfile"; then
+    pass "main skips reconcile, stays quiet and succeeds when no receiver is present"
 else
-    fail "main mishandled the failure path; out: [$(cat "$outfile")]"
+    fail "no-receiver path: reconcile=$RECONCILE_CALLED rc=$MAIN_RC out: [$(cat "$outfile")]"
+fi
+
+# The bricking guard: a receiver we detected but could not configure must leave
+# gpsd at the receiver's real baud, so gpsd does not flood it at 115200.
+CONFIGURE_RC=1; CONFIGURE_BAUD=9600
+run_main
+if [ "$RECONCILE_CALLED" -eq 1 ] && [ "$RECONCILE_BAUD" = "9600" ] && grep -q WARNING "$outfile"; then
+    pass "main points gpsd at the detected baud when configuration fails"
+else
+    fail "failure path: reconcile=$RECONCILE_CALLED baud=[$RECONCILE_BAUD] out: [$(cat "$outfile")]"
+fi
+
+if [ "$MAIN_RC" -ne 0 ]; then
+    pass "main exits non-zero when a detected receiver could not be configured"
+else
+    fail "main reported success despite a configuration failure"
+fi
+
+# Nothing to point gpsd at: a failure before the receiver's baud was established
+# must leave the existing setting alone rather than guessing.
+CONFIGURE_RC=1; CONFIGURE_BAUD=""
+run_main
+if [ "$RECONCILE_CALLED" -eq 0 ] && [ "$MAIN_RC" -ne 0 ]; then
+    pass "main leaves gpsd untouched when no baud was established"
+else
+    fail "unknown-baud path: reconcile=$RECONCILE_CALLED baud=[$RECONCILE_BAUD] rc=$MAIN_RC"
 fi
 
 rm -f "$outfile" "$SYSCTL_LOG"

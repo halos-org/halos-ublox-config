@@ -184,8 +184,15 @@ configure_device() {
 # gpsd's baud lives in /etc/default/gpsd, written by pi-gen at image-build time
 # and not otherwise updatable. Keep it in sync with the receiver so a stale image
 # (or a leftover manual workaround) can't leave gpsd opening the port at the wrong
-# baud while this service drives the receiver to TARGET_BAUD.
+# baud.
+#
+# The baud is a parameter, not TARGET_BAUD, because gpsd is the second source of
+# the frame-error flood: pointed at a receiver that is still at 9600, it transmits
+# its own probes at 115200 and can disable the receiver's UART RX by itself. When
+# configuration fails against a receiver we did detect, matching gpsd to where the
+# hardware actually is yields a degraded-but-working GPS instead of a bricked one.
 reconcile_gpsd_speed() {
+    local baud="$1"
     [ -f "$GPSD_DEFAULTS" ] || return 0
 
     local current
@@ -193,15 +200,16 @@ reconcile_gpsd_speed() {
     current=$(. "$GPSD_DEFAULTS" && printf '%s' "${GPSD_OPTIONS:-}")
 
     case " $current " in
-        *" -s $TARGET_BAUD "*) return 0 ;;
+        *" -s $baud "*) return 0 ;;
     esac
 
     local updated
     if printf '%s' "$current" | grep -Eq -- '-s [0-9]+'; then
-        updated=$(printf '%s' "$current" | sed -E "s/-s [0-9]+/-s $TARGET_BAUD/")
+        updated=$(printf '%s' "$current" | sed -E "s/-s [0-9]+/-s $baud/")
     else
-        updated="${current:+$current }-s $TARGET_BAUD"
+        updated="${current:+$current }-s $baud"
     fi
+
     # Rewrite (or add) the GPSD_OPTIONS line without passing the value through a
     # sed replacement, so an option string can't corrupt or abort the edit. The
     # temp-file swap preserves the original file's ownership and permissions, and
@@ -216,7 +224,7 @@ reconcile_gpsd_speed() {
         return 0
     fi
     rm -f "$tmp"
-    echo "Reconciled gpsd baud to $TARGET_BAUD in $GPSD_DEFAULTS"
+    echo "Reconciled gpsd baud to $baud in $GPSD_DEFAULTS"
 
     # --no-block: this unit is ordered Before=gpsd.service, so a blocking restart
     # would deadlock against gpsd's start job on the apt-upgrade path.
@@ -229,7 +237,7 @@ reconcile_gpsd_speed() {
 # --- Main ---
 
 main() {
-    local uart_devices configured=0 rc device
+    local uart_devices gpsd_baud="" failures=0 rc device
     uart_devices=$(get_uart_devices)
 
     if [ -z "$uart_devices" ]; then
@@ -238,16 +246,37 @@ main() {
     fi
 
     for device in $uart_devices; do
-        if configure_device "$device"; then
-            configured=1
-        else
-            rc=$?
-            [ "$rc" -eq "$RC_NO_RECEIVER" ] || echo "WARNING: Failed to configure $device"
+        # Capture the status from configure_device itself: after a bare `if`
+        # with no else, $? is the compound's status (0), not the condition's.
+        rc=0
+        configure_device "$device" || rc=$?
+        if [ "$rc" -eq 0 ]; then
+            gpsd_baud="$TARGET_BAUD"
+            continue
+        fi
+        if [ "$rc" -eq "$RC_NO_RECEIVER" ]; then
+            continue
+        fi
+
+        echo "WARNING: Failed to configure $device"
+        failures=$((failures + 1))
+        # Only as a fallback: a device configured successfully owns the setting.
+        if [ -z "$gpsd_baud" ] && [ -n "$RECEIVER_BAUD" ]; then
+            gpsd_baud="$RECEIVER_BAUD"
         fi
     done
 
-    if [ "$configured" -eq 1 ]; then
-        reconcile_gpsd_speed
+    if [ -n "$gpsd_baud" ]; then
+        reconcile_gpsd_speed "$gpsd_baud"
+    fi
+
+    # A detected receiver that could not be configured must leave the unit
+    # failed. Reporting success here is what kept this invisible in the field:
+    # systemd showed 0/SUCCESS while the GPS chain was dead. gpsd is ordered
+    # after this unit but does not require it, so it still starts either way.
+    if [ "$failures" -ne 0 ]; then
+        echo "u-blox configuration failed on $failures device(s)"
+        return 1
     fi
 
     echo "u-blox configuration complete"
