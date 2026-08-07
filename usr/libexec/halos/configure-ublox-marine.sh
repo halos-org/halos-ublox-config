@@ -205,23 +205,29 @@ configure_device() {
         return 1
     fi
 
-    local mon_ver
-    if ! mon_ver=$(probe_receiver "$device" "$current_baud"); then
-        echo "ERROR: receiver output seen at ${current_baud} bps but no UBX reply"
+    # A poll needs a reply, and a reply is exactly what a receiver on an
+    # oversubscribed link cannot deliver: at 10 Hz on 9600 it generates more than
+    # the line carries, its transmit buffer overflows, and poll replies are among
+    # what gets dropped -- while set commands, which travel the other way, still
+    # land. Measured on halpi.hurma: no MON-VER reply at 9600 even with a 12 s
+    # wait, yet a baud-change command sent at the same moment took effect.
+    #
+    # So a silent receiver below the target rate is not a fault to abort on. It
+    # is most likely one this script itself stranded there, and refusing to act
+    # would leave it stranded for good. Assume the default protocol, move it up,
+    # and let the authoritative poll happen once the link has headroom.
+    local mon_ver protver="$DEFAULT_PROTVER" protver_known=0
+    if mon_ver=$(probe_receiver "$device" "$current_baud"); then
+        protver=$(parse_protver "$mon_ver")
+        protver_known=1
+    elif [ "$current_baud" -eq "$TARGET_BAUD" ]; then
+        echo "ERROR: receiver output seen at ${current_baud} bps but no UBX reply."
+        echo "       At the target rate there is no bandwidth excuse for this."
         return 1
+    else
+        echo "WARNING: no UBX reply at ${current_baud} bps — assuming protocol"
+        echo "         ${protver} and moving the receiver up before configuring it."
     fi
-
-    local protver
-    protver=$(parse_protver "$mon_ver")
-    echo "Protocol version: $protver"
-
-    echo "Setting 10 Hz update rate..."
-    run_ubxtool "$device" "$current_baud" "$protver" -p "CFG-RATE,$TARGET_RATE" \
-        || { echo "ERROR: RATE failed"; return 1; }
-
-    echo "Setting Sea dynamic model..."
-    run_ubxtool "$device" "$current_baud" "$protver" -p "MODEL,$TARGET_MODEL" \
-        || { echo "ERROR: MODEL failed"; return 1; }
 
     if [ "$current_baud" -ne "$TARGET_BAUD" ]; then
         echo "Changing baud rate to $TARGET_BAUD..."
@@ -240,6 +246,26 @@ configure_device() {
         current_baud="$TARGET_BAUD"
         RECEIVER_BAUD="$current_baud"
     fi
+
+    # Rate and model are set only now, at the target baud. Setting 10 Hz first
+    # and raising the baud afterwards -- the previous order -- puts the receiver
+    # on an oversubscribed link for the window in between, and if the baud change
+    # then fails it stays there: transmitting, unpollable, and looking to every
+    # later boot like a receiver that answers nothing.
+    if [ "$protver_known" -eq 0 ]; then
+        mon_ver=$(probe_receiver "$device" "$current_baud") \
+            || { echo "ERROR: still no UBX reply at ${current_baud} bps"; return 1; }
+        protver=$(parse_protver "$mon_ver")
+    fi
+    echo "Protocol version: $protver"
+
+    echo "Setting 10 Hz update rate..."
+    run_ubxtool "$device" "$current_baud" "$protver" -p "CFG-RATE,$TARGET_RATE" \
+        || { echo "ERROR: RATE failed"; return 1; }
+
+    echo "Setting Sea dynamic model..."
+    run_ubxtool "$device" "$current_baud" "$protver" -p "MODEL,$TARGET_MODEL" \
+        || { echo "ERROR: MODEL failed"; return 1; }
 
     echo "Saving to BBR..."
     run_ubxtool "$device" "$current_baud" "$protver" -p SAVE \

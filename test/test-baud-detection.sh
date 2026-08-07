@@ -185,6 +185,54 @@ else
     pass "addresses the receiver at its detected baud"
 fi
 
+# --- configure_device: order of operations, and the stranded-receiver path ---
+# A receiver at 10 Hz on 9600 overruns its transmit buffer and drops poll
+# replies while still accepting commands. Setting the rate before raising the
+# baud is what puts it there, so the baud has to move first.
+SILENT_BELOW_TARGET=0
+ubxtool() {
+    printf '%s\n' "ubxtool $*" >> "$UBX_LOG"
+    case "$*" in
+        *"-S 115200"*)   # the switch lands: the receiver reappears at 115200
+            SAMPLE_115200="$RMC"; SAMPLE_9600="$GARBAGE"; SILENT_BELOW_TARGET=0 ;;
+    esac
+    if [ "$SILENT_BELOW_TARGET" -eq 1 ]; then
+        return 0        # command accepted, no reply -- the oversubscribed case
+    fi
+    printf 'UBX-MON-VER:\n  PROTVER=18\n'
+}
+
+# Line number of the first matching call, empty if never called. grep returning
+# 1 must not abort the suite, so it is guarded before the pipe.
+order_of() { { grep -n -e "$1" "$UBX_LOG" || true; } | head -1 | cut -d: -f1; }
+
+: > "$UBX_LOG"; SAMPLE_115200="$GARBAGE"; SAMPLE_9600="$RMC"; SILENT_BELOW_TARGET=0
+rc=0; configure_device /dev/ttyAMA0 >/dev/null 2>&1 || rc=$?
+baud_at=$(order_of "\-S 115200"); rate_at=$(order_of "CFG-RATE")
+if [ "$rc" -eq 0 ] && [ -n "$baud_at" ] && [ -n "$rate_at" ] && [ "$baud_at" -lt "$rate_at" ]; then
+    pass "raises the baud before setting the rate"
+else
+    fail "ordering wrong (rc=$rc baud@${baud_at:-none} rate@${rate_at:-none})"
+fi
+
+# Stranded at 9600 and answering nothing: recover it rather than giving up.
+: > "$UBX_LOG"; SAMPLE_115200="$GARBAGE"; SAMPLE_9600="$RMC"; SILENT_BELOW_TARGET=1
+rc=0; configure_device /dev/ttyAMA0 >/dev/null 2>&1 || rc=$?
+if [ "$rc" -eq 0 ] && grep -q -- "-S 115200" "$UBX_LOG"; then
+    pass "moves a silent below-target receiver up instead of aborting"
+else
+    fail "gave up on a recoverable stranded receiver (rc=$rc): [$(cat "$UBX_LOG")]"
+fi
+
+# Silent at the target rate is a genuine fault: no bandwidth excuse there.
+: > "$UBX_LOG"; SAMPLE_115200="$RMC"; SAMPLE_9600="$GARBAGE"; SILENT_BELOW_TARGET=1
+rc=0; configure_device /dev/ttyAMA0 >/dev/null 2>&1 || rc=$?
+if [ "$rc" -eq 1 ] && ! grep -q "CFG-RATE" "$UBX_LOG"; then
+    pass "fails on a receiver that is silent at the target rate"
+else
+    fail "did not fail on a silent target-rate receiver (rc=$rc): [$(cat "$UBX_LOG")]"
+fi
+
 rm -f "$READ_LOG" "$UBX_LOG"
 unset -f read_port ubxtool
 
