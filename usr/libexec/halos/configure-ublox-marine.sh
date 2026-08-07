@@ -11,8 +11,9 @@ DEFAULT_PROTVER=18
 UBXTOOL_WAIT=2       # seconds
 SNIFF_SECONDS=3      # passive listen window per candidate baud
 SNIFF_FLUSH=0.5      # discard window for bytes framed at the previous baud
+SNIFF_MAX_BYTES=8192 # cap on a sample: enough to decide, bounded parse cost
+DETECT_RETRIES=2     # detection attempts before declaring a device silent
 UBX_SYNC_MIN=3       # UBX sync headers needed to call a sample a receiver stream
-RC_NO_RECEIVER=2     # configure_device: no receiver found (skip, not a failure)
 
 # Set by detect_baud.
 DETECTED_BAUD=""
@@ -58,7 +59,22 @@ read_port() {
     # that captures it discards them regardless -- but doing it here keeps bash
     # from logging "ignored null byte in input" on every read. UBX binary is full
     # of them, so that is one warning per baud per boot on a healthy device.
-    timeout "$SNIFF_SECONDS" cat "$device" 2>/dev/null | LC_ALL=C tr -d '\000' || true
+    #
+    # Capped because the sample feeds string parsers that are superlinear in its
+    # length, and because deciding needs a few sentences, not three seconds of
+    # stream. Without the cap a full window at 115200 is ~34 KB and the parsers
+    # cost seconds of pure bash per boot, inside a 60 s unit budget.
+    timeout "$SNIFF_SECONDS" cat "$device" 2>/dev/null \
+        | head -c "$SNIFF_MAX_BYTES" | LC_ALL=C tr -d '\000' || true
+
+    # termios belongs to the port, not to our descriptor. Another process opening
+    # the device mid-listen re-sets the rate under us, and the bytes we just read
+    # were then framed at ITS rate while we credit them to ours -- after which we
+    # would transmit at a rate the receiver is not running at. Discard a sample
+    # whose rate no longer matches the one under test.
+    local now
+    now=$(stty -F "$device" speed 2>/dev/null | tr -dc '0-9') || return 1
+    [ "$now" = "$baud" ] || return 1
 }
 
 # A valid checksum is what separates NMEA from the line noise a mismatched baud
@@ -117,15 +133,13 @@ rx_disabled() {
 # Byte-boundary safety: the hex dump is delimited per byte, so "b5:62" cannot
 # match across the seam of an unrelated pair such as ab 56 2c.
 ubx_sync_count() {
-    local hex rest count=0
+    local hex
     hex=$(printf '%s' "$1" | od -An -tx1 -v | tr -s ' \n' ':')
-    rest="$hex"
-    while [ "${rest#*b5:62}" != "$rest" ]; do
-        rest="${rest#*b5:62}"
-        count=$((count + 1))
-        [ "$count" -ge "$UBX_SYNC_MIN" ] && break
-    done
-    echo "$count"
+    # grep, not repeated ${rest#*b5:62} stripping: that re-scans from the start
+    # on every iteration, so the no-match path -- which is every wrong-rate
+    # sample -- is quadratic. No `head` in the pipeline: it would close the pipe
+    # early and the resulting SIGPIPE reads as a failure under pipefail.
+    printf '%s' "$hex" | { grep -o 'b5:62' || true; } | wc -l | tr -dc '0-9'
 }
 
 has_ubx_frames() {
@@ -137,7 +151,7 @@ has_receiver_output() {
     has_valid_nmea "$1" || has_ubx_frames "$1"
 }
 
-detect_baud() {
+detect_once() {
     local device="$1" baud sample
     DETECTED_BAUD=""
     DETECTED_RX_DISABLED=0
@@ -156,6 +170,21 @@ detect_baud() {
     return 1
 }
 
+# Silence is not proof of absence, and treating it as such is now expensive: an
+# undetected device fails the unit. A receiver still initialising at cold boot,
+# or one whose window happened to land between sentences at 1 Hz, would otherwise
+# strand a healthy device in a failed state until the next reboot. Retry before
+# concluding. Retrying costs nothing on the common path, which succeeds first try.
+detect_baud() {
+    local device="$1" attempt=1
+    while :; do
+        detect_once "$device" && return 0
+        [ "$attempt" -ge "$DETECT_RETRIES" ] && return 1
+        echo "Nothing heard on $device, retrying ($attempt/$DETECT_RETRIES)..."
+        attempt=$((attempt + 1))
+    done
+}
+
 probe_receiver() {
     local device="$1" baud="$2" output
     output=$(ubxtool -f "$device" -s "$baud" -w "$UBXTOOL_WAIT" -p MON-VER 2>/dev/null)
@@ -167,17 +196,20 @@ probe_receiver() {
     echo "$output"
 }
 
+# Bash regex, not `grep -oP`: -P is a GNU extension, so on BSD grep the match
+# silently fails and every receiver is addressed with the default version.
 parse_protver() {
-    local ver
-    ver=$(echo "$1" | grep -oP 'PROTVER=\K[0-9]+' | head -1)
-    echo "${ver:-$DEFAULT_PROTVER}"
+    if [[ "$1" =~ PROTVER=([0-9]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+    else
+        echo "$DEFAULT_PROTVER"
+    fi
 }
 
 # Output discarded, not just stderr: while ubxtool waits it prints every UBX
 # message the receiver sends, which is hundreds of lines per invocation. No
-# caller reads it (only probe_receiver's output is parsed), and burying this
-# unit's own messages under that volume is part of why the failure in #5 went
-# unnoticed until the journal had rotated.
+# caller reads it -- only probe_receiver's output is parsed -- and this unit's
+# own messages have to stay findable in the journal.
 run_ubxtool() {
     local device="$1" baud="$2" protver="$3"
     shift 3
@@ -190,8 +222,16 @@ configure_device() {
 
     RECEIVER_BAUD=""
     if ! detect_baud "$device"; then
-        echo "No receiver detected on $device — skipping"
-        return "$RC_NO_RECEIVER"
+        # A device listed in DEVICES is one gpsd will open and transmit into, so
+        # hearing nothing from it is a fault, not an absence. Reporting success
+        # here is what let the original failure hide: the port was held, or the
+        # receiver was streaming a protocol detection did not know, and the unit
+        # said 0/SUCCESS either way. gpsd is left at whatever rate it already had
+        # -- guessing one is what floods a receiver.
+        echo "ERROR: no receiver output on $device at any candidate rate."
+        echo "       The device is configured in $GPSD_DEFAULTS, so something"
+        echo "       should be there: check for another process holding the port."
+        return 1
     fi
 
     local current_baud="$DETECTED_BAUD"
@@ -239,19 +279,29 @@ configure_device() {
         # switch took. Listening again is read-only, so a receiver that stayed
         # behind is found without transmitting at the rate it rejected.
         if ! detect_baud "$device" || [ "$DETECTED_BAUD" -ne "$TARGET_BAUD" ]; then
-            RECEIVER_BAUD="${DETECTED_BAUD:-$current_baud}"
-            echo "ERROR: receiver did not switch to $TARGET_BAUD (now at ${RECEIVER_BAUD} bps)"
+            # Only a rate we actually heard. Falling back to the pre-switch rate
+            # here would be backwards: this branch is reached when the receiver
+            # was found at NEITHER rate, and it was positively heard at the old
+            # one moments ago -- so silence there is evidence the switch landed.
+            # Asserting the abandoned rate would point gpsd at the one rate the
+            # receiver is known not to be using. Empty makes main leave the
+            # setting alone, which is its existing behaviour for an unknown rate.
+            RECEIVER_BAUD="$DETECTED_BAUD"
+            if [ "$DETECTED_RX_DISABLED" -eq 1 ]; then
+                echo "ERROR: receiver latched UART RX disabled during this run."
+                echo "       Power must be fully removed; a warm reboot will not clear it."
+            fi
+            echo "ERROR: receiver did not switch to $TARGET_BAUD (now at ${RECEIVER_BAUD:-unknown} bps)"
             return 1
         fi
         current_baud="$TARGET_BAUD"
         RECEIVER_BAUD="$current_baud"
     fi
 
-    # Rate and model are set only now, at the target baud. Setting 10 Hz first
-    # and raising the baud afterwards -- the previous order -- puts the receiver
-    # on an oversubscribed link for the window in between, and if the baud change
-    # then fails it stays there: transmitting, unpollable, and looking to every
-    # later boot like a receiver that answers nothing.
+    # Rate and model are set only now, at the target baud. 10 Hz on a 9600 link
+    # oversubscribes it, and a receiver left in that state is unpollable:
+    # transmitting, accepting commands, answering nothing, and looking to every
+    # later boot like a receiver that is not there.
     if [ "$protver_known" -eq 0 ]; then
         mon_ver=$(probe_receiver "$device" "$current_baud") \
             || { echo "ERROR: still no UBX reply at ${current_baud} bps"; return 1; }
@@ -280,11 +330,11 @@ configure_device() {
 # (or a leftover manual workaround) can't leave gpsd opening the port at the wrong
 # baud.
 #
-# The baud is a parameter, not TARGET_BAUD, because gpsd is the second source of
-# the frame-error flood: pointed at a receiver that is still at 9600, it transmits
-# its own probes at 115200 and can disable the receiver's UART RX by itself. When
-# configuration fails against a receiver we did detect, matching gpsd to where the
-# hardware actually is yields a degraded-but-working GPS instead of a bricked one.
+# The rate is a parameter because gpsd is the second source of the frame-error
+# flood: pointed at a receiver still at 9600, it transmits its own probes at
+# 115200 and can disable the receiver's UART RX by itself. Matching gpsd to where
+# the hardware actually is yields a degraded-but-working GPS rather than a
+# bricked one when configuration failed.
 reconcile_gpsd_speed() {
     local baud="$1"
     [ -f "$GPSD_DEFAULTS" ] || return 0
@@ -305,19 +355,30 @@ reconcile_gpsd_speed() {
     fi
 
     # Rewrite (or add) the GPSD_OPTIONS line without passing the value through a
-    # sed replacement, so an option string can't corrupt or abort the edit. The
-    # temp-file swap preserves the original file's ownership and permissions, and
-    # the whole step is best-effort: a write failure must not fail the unit that
-    # already configured the receiver.
+    # sed replacement, so an option string can't corrupt or abort the edit.
+    #
+    # Replaced by rename, not by truncating the target and writing into it. This
+    # file is what tells gpsd which device to open and what tells this script
+    # which devices exist, so a half-written copy -- a full SD card, power cut
+    # mid-write -- costs the GPS permanently and silently: every later boot reads
+    # no DEVICES, says "nothing to do" and exits 0. The temp file is created in
+    # the target's own directory so the rename cannot cross a filesystem, and it
+    # inherits the original's mode and owner. The step stays best-effort: a write
+    # failure must not fail a unit that already configured the receiver.
     local tmp
-    tmp=$(mktemp) || { echo "WARNING: cannot reconcile gpsd baud (mktemp failed)"; return 0; }
-    { grep -v '^GPSD_OPTIONS=' "$GPSD_DEFAULTS" || true; printf 'GPSD_OPTIONS="%s"\n' "$updated"; } > "$tmp"
-    if ! cat "$tmp" > "$GPSD_DEFAULTS"; then
-        echo "WARNING: cannot write $GPSD_DEFAULTS"
+    tmp=$(mktemp "${GPSD_DEFAULTS}.XXXXXX") \
+        || { echo "WARNING: cannot reconcile gpsd baud (mktemp failed)"; return 0; }
+    # cp -p first so the temp file inherits mode and owner (POSIX; --reference is
+    # a GNU extension), then rewrite its contents -- a redirect truncates without
+    # touching either. Falls back to a plain copy where -p cannot preserve owner.
+    if ! { { cp -p "$GPSD_DEFAULTS" "$tmp" 2>/dev/null || cp "$GPSD_DEFAULTS" "$tmp"; } \
+           && { { grep -v '^GPSD_OPTIONS=' "$GPSD_DEFAULTS" || true
+                  printf 'GPSD_OPTIONS="%s"\n' "$updated"; } > "$tmp"; } \
+           && mv -f "$tmp" "$GPSD_DEFAULTS"; }; then
+        echo "WARNING: cannot write $GPSD_DEFAULTS (left unchanged)"
         rm -f "$tmp"
         return 0
     fi
-    rm -f "$tmp"
     echo "Reconciled gpsd baud to $baud in $GPSD_DEFAULTS"
 
     # --no-block: this unit is ordered Before=gpsd.service, so a blocking restart
@@ -348,9 +409,14 @@ GPSD_STOPPED=0
 take_port() {
     systemctl is-active --quiet gpsd.service || return 0
     echo "gpsd holds the port — stopping it for the duration"
-    # shellcheck disable=SC2086  # deliberate word splitting: two unit names
-    systemctl stop $GPSD_UNITS || return 0
+    # Armed BEFORE the stop, not after. `systemctl stop` on two units reports
+    # failure if either job fails, having already stopped the other, so setting
+    # the flag on success leaves the common partial case -- socket down, service
+    # stop timed out -- with nothing recording that a restore is owed. Starting a
+    # unit that is already running is a no-op, so arming early is strictly safer.
     GPSD_STOPPED=1
+    # shellcheck disable=SC2086  # deliberate word splitting: two unit names
+    systemctl stop $GPSD_UNITS || return 1
 }
 
 # --no-block because this unit is ordered Before=gpsd.service: a blocking start
@@ -361,13 +427,14 @@ release_port() {
     GPSD_STOPPED=0
     echo "Restarting gpsd"
     # shellcheck disable=SC2086  # deliberate word splitting: two unit names
-    systemctl --no-block start $GPSD_UNITS || true
+    systemctl --no-block start $GPSD_UNITS \
+        || echo "WARNING: could not queue gpsd restart — check gpsd.service"
 }
 
 # --- Main ---
 
 main() {
-    local uart_devices gpsd_baud="" failures=0 rc device
+    local uart_devices gpsd_baud="" gpsd_conflict=0 failures=0 rc device
     uart_devices=$(get_uart_devices)
 
     if [ -z "$uart_devices" ]; then
@@ -383,23 +450,32 @@ main() {
         # with no else, $? is the compound's status (0), not the condition's.
         rc=0
         configure_device "$device" || rc=$?
-        if [ "$rc" -eq 0 ]; then
-            gpsd_baud="$TARGET_BAUD"
-            continue
-        fi
-        if [ "$rc" -eq "$RC_NO_RECEIVER" ]; then
-            continue
+        if [ "$rc" -ne 0 ]; then
+            echo "WARNING: Failed to configure $device"
+            failures=$((failures + 1))
         fi
 
-        echo "WARNING: Failed to configure $device"
-        failures=$((failures + 1))
-        # Only as a fallback: a device configured successfully owns the setting.
-        if [ -z "$gpsd_baud" ] && [ -n "$RECEIVER_BAUD" ]; then
-            gpsd_baud="$RECEIVER_BAUD"
+        # Reconcile as soon as this device's rate is known, not after the loop.
+        # Between the on-wire change and this write, gpsd's configured rate is
+        # stale, and anything that ends the run in that window -- a timeout kill,
+        # an admin restart, shutdown -- reaches release_port, which starts gpsd
+        # at the old rate and points it at a receiver that has already moved.
+        if [ -n "$RECEIVER_BAUD" ]; then
+            if [ -n "$gpsd_baud" ] && [ "$gpsd_baud" != "$RECEIVER_BAUD" ]; then
+                # gpsd's -s is global, so two receivers at different rates cannot
+                # both be served. Writing either one points gpsd at a rate the
+                # other is not using, which is the flood this exists to prevent.
+                echo "WARNING: $device runs at $RECEIVER_BAUD but another device"
+                echo "         runs at $gpsd_baud; gpsd has one global speed, so"
+                echo "         $GPSD_DEFAULTS is left untouched."
+                gpsd_conflict=1
+            else
+                gpsd_baud="$RECEIVER_BAUD"
+            fi
         fi
     done
 
-    if [ -n "$gpsd_baud" ]; then
+    if [ -n "$gpsd_baud" ] && [ "$gpsd_conflict" -eq 0 ]; then
         reconcile_gpsd_speed "$gpsd_baud"
     fi
 
@@ -408,9 +484,9 @@ main() {
     release_port
 
     # A detected receiver that could not be configured must leave the unit
-    # failed. Reporting success here is what kept this invisible in the field:
-    # systemd showed 0/SUCCESS while the GPS chain was dead. gpsd is ordered
-    # after this unit but does not require it, so it still starts either way.
+    # failed: a success exit here means systemd reports 0/SUCCESS while the GPS
+    # chain is dead. gpsd is ordered after this unit but does not require it, so
+    # it starts either way.
     if [ "$failures" -ne 0 ]; then
         echo "u-blox configuration failed on $failures device(s)"
         return 1
