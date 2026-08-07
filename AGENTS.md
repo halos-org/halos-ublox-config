@@ -38,8 +38,8 @@ halos-ublox-config/
 
 1. Systemd starts `configure-ublox-marine.service` before `gpsd.service`
 2. Script reads UART devices from `/etc/default/gpsd`
-3. For each `/dev/ttyAMA*` device, detects the current baud by **listening only** — 115200 then 9600, accepting the rate that yields a checksum-valid NMEA sentence
-4. If found, configures rate, dynamic model, baud rate, and saves to BBR, addressing the receiver at the detected rate throughout
+3. For each `/dev/ttyAMA*` device, detects the current rate by **listening only** — 115200 then 9600, accepting the rate that yields either a checksum-valid NMEA sentence or a UBX binary stream
+4. If found, raises the receiver to 115200 first, then sets update rate and dynamic model at that rate and saves to BBR, addressing the receiver at its current rate throughout
 5. Reconciles `/etc/default/gpsd` so gpsd's `-s` speed matches where the receiver actually is, restarting gpsd if it is already running
 6. gpsd then reads the receiver at a baud that matches it
 
@@ -56,11 +56,12 @@ Consequences for anyone editing this:
 
 ## What a live receiver actually sounds like
 
-Three things that only showed up against real hardware, each of which made detection silently report "no receiver" — a success exit:
+What only showed up against real hardware. Each of these made detection silently report "no receiver", which used to be a success exit:
 
 - **NMEA is not the only protocol.** gpsd switches u-blox devices into UBX binary mode when it takes over, and that survives a warm reboot. A capture from a device in normal service held 11801 bytes, 210 UBX frame headers and zero NMEA sentences. `has_receiver_output` accepts either; do not narrow it back to NMEA.
 - **The tty queue outlives a baud change.** Bytes already queued were framed by the UART at the previous rate, and `stty` neither re-frames nor discards them. Sampling immediately after the switch reads the *old* rate's valid output and accepts the new rate as correct — measured as an 11416-byte "9600" sample, four times what 9600 can carry in the window. `read_port` drains and discards before sampling; removing that reintroduces a false positive that picks the wrong baud.
 - **The baud is raised before anything else is set.** 10 Hz on a 9600 link oversubscribes it: the receiver generates more than the line carries, its transmit buffer overflows, and poll replies get dropped — while set commands, travelling the other way, still land. Measured on halpi.hurma: no MON-VER reply even at a 12 s wait, yet a baud command sent at the same moment took effect. Setting the rate first and raising the baud after strands the receiver there if the second step fails, and it then looks to every later boot like a receiver that answers nothing. Do not reorder these back. It also follows that a silent receiver *below* the target rate is not a fault to abort on — it is probably one this script stranded — while silence *at* the target rate is, since there is no bandwidth excuse.
+- **A device that is listed but silent is a fault, not an absence.** `DEVICES` names the ports gpsd will open and transmit into, so hearing nothing from one is a failure and exits non-zero. That is deliberate: the two field failures both presented as "no receiver detected" followed by a success exit, once because gpsd held the port and once because the receiver spoke a protocol detection did not know. gpsd is left at whatever rate it already had — guessing one is what floods a receiver. The cost is that detection must not be flaky, which is why it retries before concluding: with a silent device now failing the unit, a receiver that is merely slow to start would otherwise strand a healthy device until the next reboot.
 - **gpsd owns the device while it runs.** A sample taken underneath it is empty. Boot is safe because of `Before=gpsd.service`, but the apt-upgrade path restarts this unit on a live system, and on a marine device Signal K holds a client connection that keeps re-activating gpsd through its socket. `take_port` stops both units, keyed on `gpsd.service` — keying on the socket instead would stop and churn gpsd on every boot for nothing, since the socket is active from early boot and owns no hardware.
 
 ## Version Management

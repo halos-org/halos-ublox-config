@@ -18,10 +18,12 @@ ROM-based u-blox modules (such as the MAX-M8Q on HALPI2) have no flash memory. C
 
 1. `configure-ublox-marine.service` runs before `gpsd.service` on every boot
 2. Reads UART devices from `/etc/default/gpsd`
-3. Listens to each `/dev/ttyAMA*` device at 115200 then 9600 bps, accepting the rate that yields a checksum-valid NMEA sentence
-4. Configures rate, dynamic model, and baud rate via `ubxtool`, at the detected rate
+3. Listens to each `/dev/ttyAMA*` device at 115200 then 9600 bps, accepting the rate that yields either a checksum-valid NMEA sentence or a UBX binary stream
+4. Raises the receiver to 115200 first, then sets update rate and dynamic model at that rate
 5. Saves settings to BBR (persists until next power loss)
-6. Points gpsd's `-s` speed at the receiver's actual baud
+6. Points gpsd's `-s` speed at the receiver's actual rate
+
+A device listed in `/etc/default/gpsd` that produces nothing at either rate fails the service, rather than passing as "no receiver". gpsd will open and transmit into that device regardless, so silence there is a fault worth seeing.
 
 ## Why detection is read-only
 
