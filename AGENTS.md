@@ -54,6 +54,14 @@ Consequences for anyone editing this:
 - **gpsd is a second transmitter.** Pointed at a receiver still running at 9600, gpsd's own probes at 115200 trip the same protection. `reconcile_gpsd_speed` takes the receiver's actual baud, so a device that failed to reach 115200 is left working-but-degraded rather than bricked.
 - **A detected-but-unconfigurable receiver must fail the unit.** Returning 0 there is what hid this in the field for months: systemd reported `0/SUCCESS` while the GPS chain was dead. `Before=gpsd.service` is ordering only, so failing does not stop gpsd from starting.
 
+## What a live receiver actually sounds like
+
+Three things that only showed up against real hardware, each of which made detection silently report "no receiver" — a success exit:
+
+- **NMEA is not the only protocol.** gpsd switches u-blox devices into UBX binary mode when it takes over, and that survives a warm reboot. A capture from a device in normal service held 11801 bytes, 210 UBX frame headers and zero NMEA sentences. `has_receiver_output` accepts either; do not narrow it back to NMEA.
+- **The tty queue outlives a baud change.** Bytes already queued were framed by the UART at the previous rate, and `stty` neither re-frames nor discards them. Sampling immediately after the switch reads the *old* rate's valid output and accepts the new rate as correct — measured as an 11416-byte "9600" sample, four times what 9600 can carry in the window. `read_port` drains and discards before sampling; removing that reintroduces a false positive that picks the wrong baud.
+- **gpsd owns the device while it runs.** A sample taken underneath it is empty. Boot is safe because of `Before=gpsd.service`, but the apt-upgrade path restarts this unit on a live system, and on a marine device Signal K holds a client connection that keeps re-activating gpsd through its socket. `take_port` stops both units, keyed on `gpsd.service` — keying on the socket instead would stop and churn gpsd on every boot for nothing, since the socket is active from early boot and owns no hardware.
+
 ## Version Management
 
 Use `./run bumpversion [patch|minor|major]`. Never edit VERSION or debian/changelog manually.

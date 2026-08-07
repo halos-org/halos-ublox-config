@@ -27,9 +27,11 @@ ROM-based u-blox modules (such as the MAX-M8Q on HALPI2) have no flash memory. C
 
 Transmitting UBX at a baud the receiver is not running at produces framing errors, and u-blox M8 firmware disables its UART receiver after more than 100 of them. The module keeps transmitting NMEA, so it still looks alive, but it accepts no further configuration — and HALPI2 has no GNSS reset line, so only fully removing power clears the state.
 
-Detection therefore transmits nothing. The receiver streams NMEA continuously at whatever rate it is currently running, so the baud can be established by listening, and UBX only goes out once the rate is known. A receiver that has already latched into the RX-disabled state announces it in a `$GNTXT` sentence, which the same read picks up and reports.
+Detection therefore transmits nothing. The receiver streams continuously at whatever rate it is currently running, so the baud can be established by listening, and UBX only goes out once the rate is known. A receiver that has already latched into the RX-disabled state announces it in a `$GNTXT` sentence, which the same read picks up and reports.
 
-The corollary is that a receiver configured for UBX-only output cannot be detected. Nothing in HaLOS produces that state — factory default and this package both leave NMEA enabled — and probing for it would mean transmitting blind, which is the hazard above.
+Listening accepts either protocol. A factory receiver emits NMEA, but gpsd switches u-blox devices into UBX binary mode when it takes over, and that survives a warm reboot — a capture from a device in normal service showed 11801 bytes containing 210 UBX frame headers and not one NMEA sentence. Treating NMEA as the only sign of life would report every gpsd-driven receiver as absent and skip configuring it.
+
+Two details matter for the listening itself. Bytes already queued when the rate changes were framed by the UART at the *previous* baud, and switching the rate neither re-frames nor discards them, so the queue is drained and discarded before a sample is taken — otherwise the old rate's valid output authenticates the new rate. And gpsd must not hold the device: it is stopped for the duration whenever it is running, because a sample taken underneath it is empty and reads as "no receiver".
 
 ## Part of HaLOS
 
