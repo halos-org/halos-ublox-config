@@ -120,8 +120,49 @@ outfile=$(mktemp)
 
 run_main() {
     RECONCILE_CALLED=0; RECONCILE_BAUD=""; MAIN_RC=0
+    : > "$SYSCTL_LOG"
     main > "$outfile" 2>&1 || MAIN_RC=$?
+    trap - EXIT   # main arms an EXIT trap; don't let it fire in the test shell
 }
+
+# --- port handover: gpsd owns the device while it runs ---
+# Keyed on gpsd.service alone. The socket is active from early boot on every
+# device and owns no hardware, so keying on it would churn gpsd every boot.
+SYSCTL_ACTIVE=0   # gpsd.service reports active
+CONFIGURE_RC=0; CONFIGURE_BAUD=115200
+run_main
+if grep -q "^systemctl stop gpsd.socket gpsd.service" "$SYSCTL_LOG"; then
+    pass "stops gpsd and its socket when gpsd holds the port"
+else
+    fail "did not take the port from a running gpsd; log: [$(cat "$SYSCTL_LOG")]"
+fi
+if grep -q -- "--no-block start gpsd.socket gpsd.service" "$SYSCTL_LOG"; then
+    pass "gives the port back without blocking on its own unit"
+else
+    fail "did not restart gpsd; log: [$(cat "$SYSCTL_LOG")]"
+fi
+
+# A crash part-way through must not leave the boat without gpsd.
+: > "$SYSCTL_LOG"; SYSCTL_ACTIVE=0; GPSD_STOPPED=0
+take_port >/dev/null
+( trap release_port EXIT; false ) >/dev/null 2>&1 || true
+GPSD_STOPPED=1 release_port >/dev/null
+if grep -q -- "--no-block start" "$SYSCTL_LOG"; then
+    pass "restores gpsd even when the run fails part-way"
+else
+    fail "gpsd left stopped after a failed run; log: [$(cat "$SYSCTL_LOG")]"
+fi
+
+# Boot path: gpsd.service inactive, so nothing should be stopped.
+: > "$SYSCTL_LOG"; SYSCTL_ACTIVE=1; GPSD_STOPPED=0
+CONFIGURE_RC=0; CONFIGURE_BAUD=115200
+run_main
+if grep -q "systemctl stop" "$SYSCTL_LOG"; then
+    fail "stopped gpsd at boot when it was not holding the port"
+else
+    pass "leaves gpsd alone when it is not running"
+fi
+SYSCTL_ACTIVE=1
 
 CONFIGURE_RC=0; CONFIGURE_BAUD=115200
 run_main

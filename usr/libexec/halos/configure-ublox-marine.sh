@@ -292,6 +292,42 @@ reconcile_gpsd_speed() {
     fi
 }
 
+# gpsd opens /dev/ttyAMA0 and keeps it, so a sample taken while it runs is empty
+# or truncated -- and detection reports that as "no receiver", which is a success
+# exit. The unit then claims to have configured a device it never even read.
+#
+# Boot is not the problem: this unit is ordered Before=gpsd.service, so gpsd has
+# not opened anything yet. The apt-upgrade path is, because postinst restarts
+# this unit on a live system. On a marine device that is the normal state --
+# Signal K holds a client connection to gpsd's socket, which keeps re-activating
+# gpsd.service on demand -- so the socket has to come down too, or it simply
+# restarts underneath the detection.
+#
+# Keyed on gpsd.service, not the socket: the socket is active from early boot on
+# every device and owns no hardware, so keying on it would stop and churn gpsd
+# on every single boot for nothing.
+GPSD_UNITS="gpsd.socket gpsd.service"
+GPSD_STOPPED=0
+
+take_port() {
+    systemctl is-active --quiet gpsd.service || return 0
+    echo "gpsd holds the port — stopping it for the duration"
+    # shellcheck disable=SC2086  # deliberate word splitting: two unit names
+    systemctl stop $GPSD_UNITS || return 0
+    GPSD_STOPPED=1
+}
+
+# --no-block because this unit is ordered Before=gpsd.service: a blocking start
+# would queue a job that waits for this unit to finish and deadlock on itself.
+# Runs from an EXIT trap so a failure part-way through cannot leave gpsd down.
+release_port() {
+    [ "$GPSD_STOPPED" -eq 1 ] || return 0
+    GPSD_STOPPED=0
+    echo "Restarting gpsd"
+    # shellcheck disable=SC2086  # deliberate word splitting: two unit names
+    systemctl --no-block start $GPSD_UNITS || true
+}
+
 # --- Main ---
 
 main() {
@@ -302,6 +338,9 @@ main() {
         echo "No UART GNSS devices configured — nothing to do"
         return 0
     fi
+
+    trap release_port EXIT
+    take_port
 
     for device in $uart_devices; do
         # Capture the status from configure_device itself: after a bare `if`
@@ -327,6 +366,10 @@ main() {
     if [ -n "$gpsd_baud" ]; then
         reconcile_gpsd_speed "$gpsd_baud"
     fi
+
+    # Explicitly, not just via the trap: the speed has to be reconciled before
+    # gpsd comes back, and the trap fires after main has already returned.
+    release_port
 
     # A detected receiver that could not be configured must leave the unit
     # failed. Reporting success here is what kept this invisible in the field:
