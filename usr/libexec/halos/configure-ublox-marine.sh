@@ -10,6 +10,8 @@ TARGET_MODEL=5       # Sea
 DEFAULT_PROTVER=18
 UBXTOOL_WAIT=2       # seconds
 SNIFF_SECONDS=3      # passive listen window per candidate baud
+SNIFF_FLUSH=0.5      # discard window for bytes framed at the previous baud
+UBX_SYNC_MIN=3       # UBX sync headers needed to call a sample a receiver stream
 RC_NO_RECEIVER=2     # configure_device: no receiver found (skip, not a failure)
 
 # Set by detect_baud.
@@ -41,6 +43,14 @@ get_uart_devices() {
 read_port() {
     local device="$1" baud="$2"
     stty -F "$device" "$baud" raw -echo -hupcl clocal 2>/dev/null || return 1
+    # Bytes already sitting in the tty queue were framed by the UART at the
+    # PREVIOUS baud, and changing the rate does not re-frame or discard them.
+    # Sampling straight after the switch therefore reads a valid stream from the
+    # old rate and authenticates the new one -- observed on halpi.hurma, where a
+    # listen at 9600 returned 11416 bytes (four times what 9600 can carry in the
+    # window) of the receiver's real 115200 UBX output. Drain first, discard it,
+    # and sample only bytes the UART framed at the rate under test.
+    timeout "$SNIFF_FLUSH" cat "$device" >/dev/null 2>&1 || true
     # cat writes each read through unbuffered, so the sample collected before
     # timeout kills it still reaches the caller. 124 (timed out) is the norm.
     timeout "$SNIFF_SECONDS" cat "$device" 2>/dev/null || true
@@ -87,8 +97,39 @@ has_valid_nmea() {
 
 # The receiver announces this state itself, in a normal NMEA sentence, and keeps
 # transmitting afterwards -- so it is visible exactly where a passive read looks.
+# Only reachable in NMEA mode, which is where it matters: a receiver that latched
+# this way was never successfully configured, so it is still at factory defaults.
 rx_disabled() {
     [[ "$(ascii_only "$1")" == *"UART RX was disabled"* ]]
+}
+
+# A receiver is not necessarily speaking NMEA. gpsd switches u-blox devices into
+# UBX binary mode when it takes over, and that survives a warm reboot, so on any
+# device gpsd has already driven the stream is pure UBX with no NMEA in it at
+# all. Treating NMEA as the only sign of life would report those as absent and
+# skip configuring them entirely.
+#
+# Byte-boundary safety: the hex dump is delimited per byte, so "b5:62" cannot
+# match across the seam of an unrelated pair such as ab 56 2c.
+ubx_sync_count() {
+    local hex rest count=0
+    hex=$(printf '%s' "$1" | od -An -tx1 -v | tr -s ' \n' ':')
+    rest="$hex"
+    while [ "${rest#*b5:62}" != "$rest" ]; do
+        rest="${rest#*b5:62}"
+        count=$((count + 1))
+        [ "$count" -ge "$UBX_SYNC_MIN" ] && break
+    done
+    echo "$count"
+}
+
+has_ubx_frames() {
+    [ "$(ubx_sync_count "$1")" -ge "$UBX_SYNC_MIN" ]
+}
+
+# Either protocol proves a receiver is present and the baud is right.
+has_receiver_output() {
+    has_valid_nmea "$1" || has_ubx_frames "$1"
 }
 
 detect_baud() {
@@ -100,7 +141,7 @@ detect_baud() {
     # ordering only costs a listen window, never a mismatched transmission.
     for baud in "$TARGET_BAUD" "$FACTORY_BAUD"; do
         sample=$(read_port "$device" "$baud") || continue
-        has_valid_nmea "$sample" || continue
+        has_receiver_output "$sample" || continue
         DETECTED_BAUD="$baud"
         if rx_disabled "$sample"; then
             DETECTED_RX_DISABLED=1
@@ -145,7 +186,7 @@ configure_device() {
 
     local current_baud="$DETECTED_BAUD"
     RECEIVER_BAUD="$current_baud"
-    echo "Receiver streaming NMEA at ${current_baud} bps"
+    echo "Receiver detected at ${current_baud} bps"
 
     if [ "$DETECTED_RX_DISABLED" -eq 1 ]; then
         echo "ERROR: receiver reports its UART RX disabled after excessive frame errors."
@@ -156,7 +197,7 @@ configure_device() {
 
     local mon_ver
     if ! mon_ver=$(probe_receiver "$device" "$current_baud"); then
-        echo "ERROR: no UBX response at ${current_baud} bps despite valid NMEA"
+        echo "ERROR: receiver output seen at ${current_baud} bps but no UBX reply"
         return 1
     fi
 

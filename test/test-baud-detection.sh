@@ -57,6 +57,39 @@ fi
 if has_valid_nmea "$GARBAGE"; then fail "reported NMEA in a pure-noise sample"; else pass "reports no NMEA in a pure-noise sample"; fi
 if has_valid_nmea ""; then fail "reported NMEA in an empty sample"; else pass "reports no NMEA in an empty sample"; fi
 
+# --- has_ubx_frames: a gpsd-driven receiver emits no NMEA at all ---
+# Real capture from halpi.hurma showed 11801 bytes, 210 UBX sync headers and
+# zero NMEA sentences: gpsd puts u-blox devices into binary mode and that
+# survives a warm reboot, so NMEA alone is not a sufficient sign of life.
+UBXFRAME=$'\xb5\x62\x01\x07\x5c\x00\x18\xa8'
+if has_ubx_frames "$UBXFRAME$UBXFRAME$UBXFRAME"; then
+    pass "detects a UBX binary stream"
+else
+    fail "missed a UBX binary stream"
+fi
+if has_ubx_frames "$UBXFRAME"; then
+    fail "accepted a single sync header as a stream"
+else
+    pass "one stray sync header is not a stream"
+fi
+if has_ubx_frames "$GARBAGE"; then fail "UBX false positive on noise"; else pass "no UBX false positive on noise"; fi
+# b5:62 must only match on a byte boundary: ab 56 2c hexdumps to "ab562c",
+# which contains "b562" one nibble in.
+STRADDLE=$'\xab\x56\x2c\xab\x56\x2c\xab\x56\x2c\xab\x56\x2c'
+if has_ubx_frames "$STRADDLE"; then
+    fail "matched a sync header straddling a byte boundary"
+else
+    pass "does not match b562 across a byte seam"
+fi
+
+# --- has_receiver_output: either protocol counts ---
+if has_receiver_output "$GGA" && has_receiver_output "$UBXFRAME$UBXFRAME$UBXFRAME"; then
+    pass "accepts either NMEA or UBX as a live receiver"
+else
+    fail "has_receiver_output rejected a live receiver"
+fi
+if has_receiver_output "$GARBAGE"; then fail "accepted noise as a receiver"; else pass "rejects noise as a receiver"; fi
+
 # --- rx_disabled ---
 if rx_disabled "$RXOFF"; then pass "detects the UART-RX-disabled notice"; else fail "missed the UART-RX-disabled notice"; fi
 if rx_disabled "$GGA"; then fail "false positive on a normal sentence"; else pass "no false positive on a normal sentence"; fi
@@ -103,9 +136,16 @@ else
 fi
 
 if detect_at "$GARBAGE" "$GARBAGE"; then
-    fail "claimed detection when no baud yielded NMEA"
+    fail "claimed detection when no baud yielded receiver output"
 else
-    pass "reports no receiver when no baud yields NMEA"
+    pass "reports no receiver when no baud yields output"
+fi
+
+# The regression this whole predicate exists for: a gpsd-driven receiver.
+if detect_at "$UBXFRAME$UBXFRAME$UBXFRAME" "$GARBAGE" && [ "$DETECTED_BAUD" = "115200" ]; then
+    pass "detects a UBX-only receiver that gpsd already switched to binary"
+else
+    fail "missed a UBX-only receiver (got [${DETECTED_BAUD:-}])"
 fi
 
 if detect_at "$GARBAGE" "$RXOFF" && [ "$DETECTED_BAUD" = "9600" ] && [ "$DETECTED_RX_DISABLED" -eq 1 ]; then
