@@ -29,9 +29,11 @@ Silence is only ever the answer once every fault that produces it has been ruled
 
 ## Why detection is read-only
 
-Transmitting UBX at a baud the receiver is not running at produces framing errors, and u-blox M8 firmware disables its UART receiver after more than 100 of them. The module keeps transmitting NMEA, so it still looks alive, but it accepts no further configuration — and HALPI2 has no GNSS reset line, so only fully removing power clears the state.
+Transmitting UBX at a baud the receiver is not running at produces framing errors, and past 100 of them in a second the receiver stops listening for the remainder of that second. It re-enables itself — the `More than 100 frame errors, UART RX was disabled` notice is emitted when RX comes back — so this costs time, not hardware.
 
-Detection therefore transmits nothing. The receiver streams continuously at whatever rate it is currently running, so the baud can be established by listening, and UBX only goes out once the rate is known. A receiver that has already latched into the RX-disabled state announces it in a `$GNTXT` sentence, which the same read picks up and reports.
+The lasting damage comes from the other end. Configuration is saved to battery-backed RAM, which HALPI2 keeps powered, so a baud written blindly and saved survives a warm reboot: the receiver ends up at a rate nothing on the host is using and looks dead until power is physically removed.
+
+Detection therefore transmits nothing. The receiver streams continuously at whatever rate it is currently running, so the baud can be established by listening, and UBX only goes out once the rate is known — which is both free and impossible to get wrong. A receiver reporting the frame-error notice is picked up by the same read and logged, since something on the line is talking at the wrong rate even though the receiver recovers.
 
 Listening accepts either protocol. A factory receiver emits NMEA, but gpsd switches u-blox devices into UBX binary mode when it takes over, and that survives a warm reboot — a capture from a device in normal service showed 11801 bytes containing 210 UBX frame headers and not one NMEA sentence. Treating NMEA as the only sign of life would report every gpsd-driven receiver as absent and skip configuring it.
 

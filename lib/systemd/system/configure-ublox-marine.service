@@ -7,7 +7,12 @@ After=dev-ttyAMA0.device
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/libexec/halos/configure-ublox-marine.sh
-TimeoutStartSec=60
+# Two probe rounds of PROBE_RETRIES x UBXTOOL_WAIT, two detection passes and the
+# three set commands put a single unanswered device near 50 s, and DEVICES may
+# name more than one. A kill lands mid-configure, with the baud already changed
+# on the wire and gpsd restarted at the old one, so the budget covers the worst
+# case rather than the expected one.
+TimeoutStartSec=120
 
 [Install]
 WantedBy=multi-user.target

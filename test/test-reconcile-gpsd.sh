@@ -183,8 +183,8 @@ else
     fail "success path: reconcile=$RECONCILE_CALLED baud=[$RECONCILE_BAUD] rc=$MAIN_RC"
 fi
 
-# The bricking guard: a receiver we detected but could not configure must leave
-# gpsd at the receiver's real baud, so gpsd does not flood it at 115200.
+# A receiver we detected but could not configure must leave gpsd at the rate the
+# receiver is actually using, or gpsd reads framing garbage and reports no fix.
 DEVICE_RESULT=([/dev/ttyAMA0]="1:9600")
 run_main
 if [ "$RECONCILE_CALLED" -eq 1 ] && [ "$RECONCILE_BAUD" = "9600" ] && grep -q WARNING "$outfile"; then
