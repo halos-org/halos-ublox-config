@@ -274,6 +274,8 @@ start_receiver() {      # start_receiver <rate> [sample]
     : > "$UBX_LOG"; : > "$MISMATCH_LOG"; : > "$READ_LOG"
     RECEIVER_BAUD=""
     STUB_FAIL_ON=""; STUB_SILENT_BELOW_TARGET=0
+    HOLDERS=""; HOLDERS_BEFORE=""; PORT_BYTES=0; PORT_IS_USABLE=0
+    DETECTED_CONTENDED=0
 }
 
 no_mismatch() {         # the safety property, asserted after every case
@@ -283,6 +285,19 @@ no_mismatch() {         # the safety property, asserted after every case
         pass "$1"
     fi
 }
+
+# The three port probes, canned. Each is stubbed rather than pointed at a real
+# device because they are the only functions here that touch hardware, and each
+# is exercised against the real thing further down. HOLDERS_BEFORE answers the
+# scan taken before the listen, HOLDERS the one after it.
+_ph_saved=$(declare -f port_holders)
+_pu_saved=$(declare -f port_usable)
+_pb_saved=$(declare -f port_byte_count)
+port_holders() {
+    if [ -s "$READ_LOG" ]; then printf '%s' "$HOLDERS"; else printf '%s' "$HOLDERS_BEFORE"; fi
+}
+port_usable() { [ "$PORT_IS_USABLE" -eq 0 ]; }
+port_byte_count() { printf '%s' "$PORT_BYTES"; }
 
 # Already at the target rate.
 start_receiver "$TARGET_BAUD"
@@ -366,19 +381,21 @@ else
 fi
 eval "$_rp_saved"
 
-# --- silence: absence unless a fault is evidenced ---
+# --- silence: absence only when every fault has been ruled out ---
 # The port has to exist for these, because a missing one is itself one of the
-# faults under test. A regular file stands in for the tty: nothing here reads it,
-# read_port is stubbed, and only the path's existence is inspected.
+# faults under test. A regular file stands in for the tty: read_port and the
+# three port probes are stubbed, so only the path's existence is inspected.
+#
+# `start_receiver 4800` is a receiver at neither candidate rate, i.e. one that
+# transmits. It is the fixture for the *traffic* case, never for an absent one --
+# an unfitted UART yields zero bytes, measured on hardware, so PORT_BYTES=0 is
+# what "no module" means here.
 PORT_NODE=$(mktemp)
-HOLDERS=""
-_ph_saved=$(declare -f port_holders)
-port_holders() { printf '%s' "$HOLDERS"; }
 
 # The reason this issue exists: /etc/default/gpsd lists the port on every HALPI2
 # marine image whether or not a module is fitted, so silence on an idle port is a
 # hardware configuration and must not fail the unit.
-start_receiver 4800    # neither candidate rate
+start_receiver 4800
 rc=0; configure_device "$PORT_NODE" >/dev/null 2>&1 || rc=$?
 if [ "$rc" -eq "$NO_RECEIVER_RC" ] && [ ! -s "$UBX_LOG" ] && [ -z "$RECEIVER_BAUD" ]; then
     pass "an idle, unheld port reports no receiver and transmits nothing"
@@ -391,66 +408,143 @@ else
     fail "expected $((DETECT_RETRIES * 2)) listens, got: [$(cat "$READ_LOG")]"
 fi
 
+# Bytes on the wire that parse at neither candidate rate: a receiver at 4800, or
+# a HAT that is not u-blox. Calling that "no receiver fitted" would exit 0 over a
+# live receiver nothing has configured.
+start_receiver 4800; PORT_BYTES=2048
+rc=0; out=$(configure_device "$PORT_NODE" 2>&1) || rc=$?
+if [ "$rc" -eq 1 ] && [ ! -s "$UBX_LOG" ]; then
+    pass "a port carrying unparseable traffic fails instead of reporting absence"
+else
+    fail "traffic port: rc=$rc transmitted [$(cat "$UBX_LOG")]"
+fi
+case "$out" in
+    *2048*) pass "says how much traffic it saw" ;;
+    *) fail "byte count not reported: [$out]" ;;
+esac
+# One stray byte on a floating line is still an empty port.
+start_receiver 4800; PORT_BYTES="$QUIET_MAX_BYTES"
+rc=0; configure_device "$PORT_NODE" >/dev/null 2>&1 || rc=$?
+if [ "$rc" -eq "$NO_RECEIVER_RC" ]; then
+    pass "a byte of line noise does not turn an empty port into a fault"
+else
+    fail "noise byte: rc=$rc"
+fi
+
 # Something else eating the receiver's bytes looks exactly like an empty port,
 # and was one of the two field failures that used to exit 0.
 start_receiver 4800; HOLDERS="gpsd[431]"
 rc=0; out=$(configure_device "$PORT_NODE" 2>&1) || rc=$?
-if [ "$rc" -eq 1 ]; then
+if [ "$rc" -eq 1 ] && [ ! -s "$UBX_LOG" ]; then
     pass "a held port fails the unit"
 else
-    fail "held port did not fail (rc=$rc)"
+    fail "held port: rc=$rc transmitted [$(cat "$UBX_LOG")]"
 fi
 case "$out" in
     *"gpsd[431]"*) pass "names what is holding the port" ;;
     *) fail "holder not named: [$out]" ;;
 esac
-HOLDERS=""
+
+# A holder that let go before the scan is the case a single point-in-time check
+# cannot see, so the scan taken before the listen is what catches it.
+start_receiver 4800; HOLDERS_BEFORE="minicom[9001]"
+rc=0; out=$(configure_device "$PORT_NODE" 2>&1) || rc=$?
+if [ "$rc" -eq 1 ]; then
+    pass "a holder present when the run started fails the unit even if it let go"
+else
+    fail "released holder was treated as absence (rc=$rc)"
+fi
+case "$out" in
+    *"minicom[9001]"*) pass "names the holder that was there at the start" ;;
+    *) fail "starting holder not named: [$out]" ;;
+esac
+
+# read_port reports a mid-listen rate change apart from an empty read, because it
+# is proof another process touched the port — which the /proc scan misses once
+# that process is gone.
+start_receiver 4800; DETECTED_CONTENDED=1
+_do_saved=$(declare -f detect_once)
+detect_once() { DETECTED_CONTENDED=1; return 1; }
+rc=0; configure_device "$PORT_NODE" >/dev/null 2>&1 || rc=$?
+if [ "$rc" -eq 1 ]; then
+    pass "a rate changed under us mid-listen fails the unit"
+else
+    fail "contention was treated as absence (rc=$rc)"
+fi
+eval "$_do_saved"
+
+# A port that exists but cannot be opened is a fault for the same reason a
+# missing one is: gpsd cannot read it either.
+start_receiver 4800; PORT_IS_USABLE=1
+rc=0; configure_device "$PORT_NODE" >/dev/null 2>&1 || rc=$?
+if [ "$rc" -eq 1 ]; then
+    pass "a port that cannot be opened fails the unit"
+else
+    fail "unopenable port was treated as absence (rc=$rc)"
+fi
 
 # A port named in DEVICES that does not exist is a broken image, not a missing
 # module: gpsd cannot open it either.
 start_receiver 4800
 rc=0; configure_device "$PORT_NODE.absent" >/dev/null 2>&1 || rc=$?
-if [ "$rc" -eq 1 ]; then
+if [ "$rc" -eq 1 ] && [ ! -s "$UBX_LOG" ]; then
     pass "a port that does not exist fails the unit"
 else
-    fail "missing port did not fail (rc=$rc)"
+    fail "missing port: rc=$rc transmitted [$(cat "$UBX_LOG")]"
 fi
 
 rm -f "$READ_LOG" "$UBX_LOG" "$MISMATCH_LOG" "$RATE_FILE" "$PORT_NODE"
 unset -f read_port ubxtool arg_after
-eval "$_ph_saved"
+eval "$_ph_saved"; eval "$_pu_saved"; eval "$_pb_saved"
 
 # --- port_holders: reads the real /proc, so only where there is one ---
 if [ -d /proc/self/fd ]; then
-    HELD_FILE=$(mktemp)
-    # A held descriptor, kept open by a process that is not this one.
-    sleep 30 < "$HELD_FILE" &
-    holder_pid=$!
-    # The kernel resolves symlinks in the temp path, and readlink reports the
-    # resolved target, so compare against the same form.
-    held_real=$(readlink "/proc/$holder_pid/fd/0" 2>/dev/null || printf '%s' "$HELD_FILE")
-    found=$(port_holders "$held_real")
+    HELD_FILE=$(mktemp); HOLDER_PID_FILE=$(mktemp)
+    # setsid because port_holders excludes its own process group, and a plain
+    # background job of a non-interactive shell stays in that group — the holder
+    # has to be genuinely foreign. `exec sleep` keeps the descriptor on the pid
+    # that was recorded, and the pid is written after the descriptor is open, so
+    # waiting for it synchronises the fixture instead of racing the child.
+    setsid bash -c 'exec 3< "$1"; echo "$BASHPID" > "$2"; exec sleep 30' \
+        _ "$HELD_FILE" "$HOLDER_PID_FILE" &
+    for _ in $(seq 1 100); do
+        [ -s "$HOLDER_PID_FILE" ] && break
+        sleep 0.05
+    done
+    holder_pid=$(cat "$HOLDER_PID_FILE")
+    # No path resolution: port_holders compares inodes, so any path naming the
+    # same file matches while the descriptor is open.
+    found=$(port_holders "$HELD_FILE")
     case "$found" in
         *"sleep[$holder_pid]"*) pass "port_holders names the process holding a device" ;;
         *) fail "port_holders missed the holder: [$found]" ;;
     esac
-    if [ -z "$(port_holders "$held_real.unheld")" ]; then
+    if [ -z "$(port_holders "$HELD_FILE.unheld")" ]; then
         pass "port_holders reports nothing for a path no one has open"
     else
         fail "port_holders invented a holder"
     fi
-    # The script reads the port itself; counting its own shell would make every
-    # silent port look held and reinstate the failure this change removes.
+    # A path is not what is compared: the same file reached through a symlink is
+    # the same port, which is how a holder inside a container is still found.
+    ln -s "$HELD_FILE" "$HELD_FILE.link"
+    case "$(port_holders "$HELD_FILE.link")" in
+        *"sleep[$holder_pid]"*) pass "port_holders matches the node, not the path spelling" ;;
+        *) fail "port_holders missed a holder reached by another path" ;;
+    esac
+    rm -f "$HELD_FILE.link"
+    # The script reads the port itself, and every subshell around this scan
+    # inherited its descriptors. Counting any of them would make a silent port
+    # look held and reinstate the bug this change removes — while still finding
+    # the foreign holder, which is the half a bare negative assertion misses.
     exec 9< "$HELD_FILE"
-    if [ -z "$(port_holders "$held_real" | grep -o "\[$$\]" || true)" ]; then
-        pass "port_holders excludes the shell doing the reading"
-    else
-        fail "port_holders counted our own descriptor"
-    fi
+    case "$(port_holders "$HELD_FILE")" in
+        *"[$$]"*) fail "port_holders counted our own descriptor" ;;
+        *"sleep[$holder_pid]"*) pass "port_holders excludes our own process group" ;;
+        *) fail "port_holders lost the holder while excluding our own" ;;
+    esac
     exec 9<&-
     kill "$holder_pid" 2>/dev/null || true
-    wait "$holder_pid" 2>/dev/null || true
-    rm -f "$HELD_FILE"
+    rm -f "$HELD_FILE" "$HOLDER_PID_FILE"
 else
     echo "skip - port_holders tests need /proc (not this platform)"
 fi
