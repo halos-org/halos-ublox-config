@@ -14,10 +14,16 @@ SNIFF_FLUSH=0.5      # discard window for bytes framed at the previous baud
 SNIFF_MAX_BYTES=8192 # cap on a sample: enough to decide, bounded parse cost
 DETECT_RETRIES=2     # detection attempts before declaring a device silent
 UBX_SYNC_MIN=3       # UBX sync headers needed to call a sample a receiver stream
+NO_RECEIVER_RC=2     # configure_device: the port is idle and unheld — nothing fitted
+QUIET_MAX_BYTES=1    # bytes a listen window may yield and still count as silence
+READ_CONTENDED_RC=2  # read_port: the port's rate changed under us mid-listen
 
 # Set by detect_baud.
 DETECTED_BAUD=""
 DETECTED_RX_DISABLED=0
+# Set when a listen was invalidated by another process changing the port's rate.
+# Sticky across retries, so configure_device clears it per device.
+DETECTED_CONTENDED=0
 # Where configure_device last saw a receiver, even if configuring it failed.
 # main uses this to keep gpsd's speed matched to the hardware's actual state.
 RECEIVER_BAUD=""
@@ -72,9 +78,40 @@ read_port() {
     # were then framed at ITS rate while we credit them to ours -- after which we
     # would transmit at a rate the receiver is not running at. Discard a sample
     # whose rate no longer matches the one under test.
+    #
+    # Reported apart from an empty sample, because it is not silence: it is proof
+    # that something else touched the port while we listened, which is one of the
+    # faults the caller must not mistake for an absent receiver.
     local now
     now=$(stty -F "$device" speed 2>/dev/null | tr -dc '0-9') || return 1
-    [ "$now" = "$baud" ] || return 1
+    [ "$now" = "$baud" ] || return "$READ_CONTENDED_RC"
+}
+
+# How many bytes the port produced in one listen window, NULs included.
+#
+# read_port's sample cannot answer this. It comes back through a command
+# substitution, which drops NUL bytes, and a receiver read at a rate it is not
+# using produces mostly those -- so a talking port can arrive looking empty.
+# Measured on an unfitted HALPI2 UART: ten windows, zero bytes every time. Any
+# traffic at all therefore means something is transmitting.
+port_byte_count() {
+    local device="$1" baud="$2"
+    stty -F "$device" "$baud" raw -echo -hupcl clocal 2>/dev/null || return 1
+    timeout "$SNIFF_FLUSH" cat "$device" >/dev/null 2>&1 || true
+    # The count is on stdout; the status is not about the count. timeout kills
+    # cat and returns 124, and pipefail carries that out of the pipeline, so a
+    # caller writing `n=$(port_byte_count ...) || n=0` throws away a real
+    # measurement on every single call and reads a talking port as empty.
+    { timeout "$SNIFF_SECONDS" cat "$device" 2>/dev/null \
+        | head -c "$SNIFF_MAX_BYTES" | wc -c | tr -dc '0-9'; } || true
+}
+
+# tcgetattr and nothing else: reading the port's speed transmits not one bit,
+# but it fails when the device cannot be opened or is not a serial port at all.
+# That distinction is otherwise lost -- read_port folds an open failure into the
+# same `return 1` as an empty read.
+port_usable() {
+    stty -F "$1" speed >/dev/null 2>&1
 }
 
 # A valid checksum is what separates NMEA from the line noise a mismatched baud
@@ -152,14 +189,17 @@ has_receiver_output() {
 }
 
 detect_once() {
-    local device="$1" baud sample
+    local device="$1" baud sample rc
     DETECTED_BAUD=""
     DETECTED_RX_DISABLED=0
 
     # Target first: an already-configured receiver is the common case, and
     # ordering only costs a listen window, never a mismatched transmission.
     for baud in "$TARGET_BAUD" "$FACTORY_BAUD"; do
-        sample=$(read_port "$device" "$baud") || continue
+        rc=0
+        sample=$(read_port "$device" "$baud") || rc=$?
+        [ "$rc" -eq "$READ_CONTENDED_RC" ] && DETECTED_CONTENDED=1
+        [ "$rc" -eq 0 ] || continue
         has_receiver_output "$sample" || continue
         DETECTED_BAUD="$baud"
         if rx_disabled "$sample"; then
@@ -170,11 +210,12 @@ detect_once() {
     return 1
 }
 
-# Silence is not proof of absence, and treating it as such is now expensive: an
-# undetected device fails the unit. A receiver still initialising at cold boot,
-# or one whose window happened to land between sentences at 1 Hz, would otherwise
-# strand a healthy device in a failed state until the next reboot. Retry before
-# concluding. Retrying costs nothing on the common path, which succeeds first try.
+# Concluding too early is the quiet failure, not the loud one: a receiver still
+# initialising at cold boot, or one whose window landed between sentences at
+# 1 Hz, is written off as absent and the unit exits 0 with the receiver left
+# unconfigured until the next reboot. These retries and the traffic check in
+# configure_device are the whole margin against that, so do not trade them away.
+# Retrying costs nothing on the common path, which succeeds on the first try.
 detect_baud() {
     local device="$1" attempt=1
     while :; do
@@ -183,6 +224,50 @@ detect_baud() {
         echo "Nothing heard on $device, retrying ($attempt/$DETECT_RETRIES)..."
         attempt=$((attempt + 1))
     done
+}
+
+# Who else has the port open, named from /proc. Neither fuser nor lsof is on a
+# HaLOS image, and the kernel already exports what they would report.
+#
+# A receiver that was never fitted and a receiver whose bytes another process is
+# consuming both read as silence, and only the second is a fault, so the fault
+# has to be evidenced rather than assumed.
+#
+# `-ef` rather than comparing readlink's output: it forks nothing, so the scan
+# costs 11 ms against 736 open descriptors instead of 680 ms, and it compares the
+# device's inode, which matches a holder that opened the same node by another
+# path -- a container with the UART mapped under a different name renders its own
+# mount namespace's path in /proc, and a string comparison misses it. Descriptors
+# on sockets and pipes resolve to nothing and fall out for free.
+#
+# Ours are excluded by process group, not by pid. Every subshell this script
+# forks inherits its descriptors, including the command substitution that calls
+# this and any pipeline around it, and all of them share the script's group --
+# so a pid list would have to know how the caller wrapped the call, and would
+# report the script's own descriptor as a foreign holder when it guessed wrong.
+port_holders() {
+    local device="$1" fd pid comm stat pgid our_pgid
+    local -a found=()
+    stat=$(< /proc/self/stat) || return 0
+    read -r _ _ our_pgid _ <<< "${stat##*) }"
+    for fd in /proc/[0-9]*/fd/*; do
+        [ "$fd" -ef "$device" ] || continue
+        pid=${fd#/proc/}
+        pid=${pid%%/*}
+        # comm is parenthesised in stat and can contain spaces, so the fields are
+        # counted from the last ')' rather than from the start of the line.
+        stat=$(< "/proc/$pid/stat") || continue
+        read -r _ _ pgid _ <<< "${stat##*) }"
+        [ "$pgid" = "$our_pgid" ] && continue
+        # Filtered because comm is 15 bytes of the process's own choosing,
+        # control characters included, and this reaches a terminal.
+        comm=""
+        read -r comm < "/proc/$pid/comm" 2>/dev/null || true
+        comm=${comm//[![:print:]]/}
+        found+=("${comm:-?}[${pid}]")
+    done
+    [ "${#found[@]}" -eq 0 ] && return 0
+    printf '%s\n' "${found[@]}" | sort -u | paste -sd ' ' -
 }
 
 probe_receiver() {
@@ -221,17 +306,76 @@ configure_device() {
     echo "Configuring $device..."
 
     RECEIVER_BAUD=""
+    DETECTED_CONTENDED=0
+
+    # Sampled before the listen as well as after it. The scan is one point in
+    # time, so a process that had the port during the listen windows and let go
+    # before the end leaves an empty result -- and reporting a live receiver as
+    # absent is the one outcome worse than a failure.
+    local holders_before
+    holders_before=$(port_holders "$device")
+
     if ! detect_baud "$device"; then
-        # A device listed in DEVICES is one gpsd will open and transmit into, so
-        # hearing nothing from it is a fault, not an absence. Reporting success
-        # here is what let the original failure hide: the port was held, or the
-        # receiver was streaming a protocol detection did not know, and the unit
-        # said 0/SUCCESS either way. gpsd is left at whatever rate it already had
-        # -- guessing one is what floods a receiver.
-        echo "ERROR: no receiver output on $device at any candidate rate."
-        echo "       The device is configured in $GPSD_DEFAULTS, so something"
-        echo "       should be there: check for another process holding the port."
-        return 1
+        # Silence carries no information by itself. The port is the SoC UART and
+        # pi-gen lists it in /etc/default/gpsd on every HALPI2 marine image, so a
+        # board with no module is silent, and so is one whose receiver something
+        # else is consuming. Only the second is a fault, so each fault is
+        # evidenced directly and everything left over is an absence.
+        #
+        # gpsd is left at whatever rate it already had. Guessing one is what
+        # floods a receiver.
+        if [ ! -e "$device" ]; then
+            echo "ERROR: $device is listed in $GPSD_DEFAULTS but does not exist."
+            echo "       gpsd cannot open it either. Check that the UART is"
+            echo "       enabled in the boot configuration."
+            return 1
+        fi
+
+        if ! port_usable "$device"; then
+            echo "ERROR: $device exists but cannot be opened as a serial port."
+            echo "       gpsd cannot read it either."
+            return 1
+        fi
+
+        local holders
+        holders=$(port_holders "$device")
+        if [ -n "$holders" ]; then
+            echo "ERROR: nothing heard on $device, which is held by: $holders"
+            echo "       A process holding the port consumes the receiver's"
+            echo "       output, which is indistinguishable from an empty port."
+            return 1
+        fi
+        if [ -n "$holders_before" ]; then
+            echo "ERROR: nothing heard on $device, which was held by"
+            echo "       $holders_before when this run started. Every sample was"
+            echo "       taken while another process had the port, so the silence"
+            echo "       says nothing about the hardware."
+            return 1
+        fi
+        if [ "$DETECTED_CONTENDED" -eq 1 ]; then
+            echo "ERROR: nothing heard on $device, and its rate was changed by"
+            echo "       another process while this run listened. The samples are"
+            echo "       not evidence about the hardware."
+            return 1
+        fi
+
+        # A port with traffic on it is not an empty port, whatever that traffic
+        # is: a receiver at a rate outside the two candidates, or one that is not
+        # u-blox at all. Calling it absent would exit 0 over a live receiver that
+        # nothing then configures, which is the failure shape that hid the
+        # original bug for months.
+        local bytes
+        bytes=$(port_byte_count "$device" "$TARGET_BAUD" || true)
+        if [ "${bytes:-0}" -gt "$QUIET_MAX_BYTES" ]; then
+            echo "ERROR: $device carried $bytes bytes in ${SNIFF_SECONDS}s but"
+            echo "       nothing parseable at $TARGET_BAUD or $FACTORY_BAUD bps."
+            echo "       Something is transmitting that this script cannot"
+            echo "       address: a receiver at another rate, or not a u-blox."
+            return 1
+        fi
+
+        echo "Nothing on $device and nothing holding it — no receiver fitted."
+        return "$NO_RECEIVER_RC"
     fi
 
     local current_baud="$DETECTED_BAUD"
@@ -390,8 +534,10 @@ reconcile_gpsd_speed() {
 }
 
 # gpsd opens /dev/ttyAMA0 and keeps it, so a sample taken while it runs is empty
-# or truncated -- and detection reports that as "no receiver", which is a success
-# exit. The unit then claims to have configured a device it never even read.
+# or truncated. Leaving it there would make the unit fail on every device gpsd
+# happens to be running on, naming gpsd itself as the holder -- correct, and
+# useless. Take the port instead, and the holder check is left to report the
+# processes that have no business on it.
 #
 # Boot is not the problem: this unit is ordered Before=gpsd.service, so gpsd has
 # not opened anything yet. The apt-upgrade path is, because postinst restarts
@@ -434,7 +580,7 @@ release_port() {
 # --- Main ---
 
 main() {
-    local uart_devices gpsd_baud="" gpsd_conflict=0 failures=0 rc device
+    local uart_devices gpsd_baud="" gpsd_conflict=0 failures=0 absent=0 rc device
     uart_devices=$(get_uart_devices)
 
     if [ -z "$uart_devices" ]; then
@@ -450,10 +596,14 @@ main() {
         # with no else, $? is the compound's status (0), not the condition's.
         rc=0
         configure_device "$device" || rc=$?
-        if [ "$rc" -ne 0 ]; then
-            echo "WARNING: Failed to configure $device"
-            failures=$((failures + 1))
-        fi
+        case "$rc" in
+            0) ;;
+            "$NO_RECEIVER_RC") absent=$((absent + 1)) ;;
+            *)
+                echo "WARNING: Failed to configure $device"
+                failures=$((failures + 1))
+                ;;
+        esac
 
         # Reconcile as soon as this device's rate is known, not after the loop.
         # Between the on-wire change and this write, gpsd's configured rate is
@@ -490,6 +640,13 @@ main() {
     if [ "$failures" -ne 0 ]; then
         echo "u-blox configuration failed on $failures device(s)"
         return 1
+    fi
+
+    # An absent receiver is a hardware configuration, not a fault, so it exits 0
+    # and leaves the unit active. The journal line above says which port was
+    # empty, which is where someone expecting a receiver should look.
+    if [ "$absent" -ne 0 ]; then
+        echo "No GNSS receiver present on $absent configured device(s)"
     fi
 
     echo "u-blox configuration complete"

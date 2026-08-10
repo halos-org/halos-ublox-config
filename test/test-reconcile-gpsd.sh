@@ -208,6 +208,44 @@ else
     fail "unknown-baud path: reconcile=$RECONCILE_CALLED baud=[$RECONCILE_BAUD] rc=$MAIN_RC"
 fi
 
+# A board with no module fitted must not sit degraded for its whole life. The
+# port is listed in /etc/default/gpsd on every HALPI2 marine image regardless of
+# what is soldered to it, so its presence there proves nothing.
+DEVICE_RESULT=([/dev/ttyAMA0]="$NO_RECEIVER_RC:")
+run_main
+if [ "$MAIN_RC" -eq 0 ] && [ "$RECONCILE_CALLED" -eq 0 ]; then
+    pass "main succeeds and leaves gpsd alone when no receiver is fitted"
+else
+    fail "absent receiver: rc=$MAIN_RC reconcile=$RECONCILE_CALLED out: [$(cat "$outfile")]"
+fi
+if grep -q "No GNSS receiver present on 1" "$outfile"; then
+    pass "main records the absence in the journal"
+else
+    fail "absence not reported: [$(cat "$outfile")]"
+fi
+
+# Absence is counted separately from failure, so it cannot swallow one.
+DEVICE_LIST="/dev/ttyAMA0 /dev/ttyAMA1"
+DEVICE_RESULT=([/dev/ttyAMA0]="$NO_RECEIVER_RC:" [/dev/ttyAMA1]="1:115200")
+run_main
+if [ "$MAIN_RC" -ne 0 ]; then
+    pass "an absent receiver does not mask a failure on another device"
+else
+    fail "absence masked a failure: rc=$MAIN_RC out: [$(cat "$outfile")]"
+fi
+
+# An empty port alongside a working one must not cost the working one its baud:
+# the absent device establishes no rate, so there is nothing for it to disagree
+# with and gpsd still gets pointed at the receiver that is there.
+DEVICE_RESULT=([/dev/ttyAMA0]="$NO_RECEIVER_RC:" [/dev/ttyAMA1]="0:115200")
+run_main
+if [ "$MAIN_RC" -eq 0 ] && [ "$RECONCILE_CALLED" -eq 1 ] && [ "$RECONCILE_BAUD" = "115200" ]; then
+    pass "an empty port does not stop gpsd being pointed at a working receiver"
+else
+    fail "absent+working: rc=$MAIN_RC reconcile=$RECONCILE_CALLED baud=[$RECONCILE_BAUD]"
+fi
+DEVICE_LIST="/dev/ttyAMA0"; DEVICE_RESULT=([/dev/ttyAMA0]="0:115200")
+
 # Ordering: gpsd's config must be corrected before gpsd is allowed back.
 SERVICE_ACTIVE=0
 DEVICE_RESULT=([/dev/ttyAMA0]="0:115200")
