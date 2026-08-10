@@ -246,6 +246,7 @@ arg_after() {   # arg_after <flag> <args...>
 STUB_PROTVER=27          # deliberately != DEFAULT_PROTVER so the two are distinguishable
 STUB_SILENT_BELOW_TARGET=0
 STUB_FAIL_ON=""
+STUB_NO_PROTVER=0
 
 ubxtool() {
     printf 'ubxtool %s\n' "$*" >> "$UBX_LOG"
@@ -277,7 +278,11 @@ ubxtool() {
     if [ "$STUB_SILENT_BELOW_TARGET" -eq 1 ] && [ "$actual" != "$TARGET_BAUD" ]; then
         return 0        # oversubscribed link: command lands, reply is dropped
     fi
-    printf 'UBX-MON-VER:\n  PROTVER=%s\n' "$STUB_PROTVER"
+    if [ "$STUB_NO_PROTVER" -eq 1 ]; then
+        printf 'UBX-MON-VER:\n  swVersion ROM CORE 3.01\n'   # answered, named no version
+    else
+        printf 'UBX-MON-VER:\n  PROTVER=%s\n' "$STUB_PROTVER"
+    fi
 }
 
 read_port() {
@@ -291,7 +296,7 @@ start_receiver() {      # start_receiver <rate> [sample]
     RECEIVER_SAMPLE="${2:-$RMC}"
     : > "$UBX_LOG"; : > "$MISMATCH_LOG"; : > "$READ_LOG"
     RECEIVER_BAUD=""
-    STUB_FAIL_ON=""; STUB_SILENT_BELOW_TARGET=0
+    STUB_FAIL_ON=""; STUB_SILENT_BELOW_TARGET=0; STUB_NO_PROTVER=0
     HOLDERS=""; HOLDERS_BEFORE=""; PORT_BYTES=0; PORT_IS_USABLE=0
     DETECTED_CONTENDED=0
     lose_mon_ver_replies 0
@@ -357,40 +362,77 @@ else
     fail "protocol fallback not exercised: [$(cat "$UBX_LOG")]"
 fi
 
-# A poll whose reply never arrives must not cost the configuration. Measured at
-# 7 of 90 polls against a live 10 Hz receiver at the target rate, so failing here
-# threw away roughly one run in twelve on working hardware.
+# A receiver that answers nothing at all is deaf, not unlucky, and must still
+# fail: it will not accept CFG-RATE either, so exiting 0 would report a healthy
+# unit over a dead GPS chain.
 start_receiver "$TARGET_BAUD"; STUB_FAIL_ON="MON-VER"
 rc=0; out=$(configure_device /dev/ttyAMA0 2>&1) || rc=$?
-if [ "$rc" -eq 0 ] && grep -q "CFG-RATE" "$UBX_LOG"; then
-    pass "configures anyway when the target-rate poll goes unanswered"
+if [ "$rc" -eq 1 ] && ! grep -q "CFG-RATE" "$UBX_LOG"; then
+    pass "a receiver that answers no poll at all still fails the unit"
 else
-    fail "unanswered poll cost the configuration (rc=$rc): [$(cat "$UBX_LOG")]"
+    fail "deaf receiver did not fail (rc=$rc): [$(cat "$UBX_LOG")]"
 fi
-if grep -q -- "-P $DEFAULT_PROTVER" "$UBX_LOG"; then
-    pass "falls back to the default protocol version"
-else
-    fail "did not use the default protver: [$(cat "$UBX_LOG")]"
-fi
-case "$out" in
-    *"assumed; the receiver never answered"*) pass "says the protocol version was assumed" ;;
-    *) fail "assumed protver not flagged in the output: [$out]" ;;
-esac
 if [ "$(grep -c -- '-p MON-VER' "$UBX_LOG")" -eq $((PROBE_RETRIES * 2)) ]; then
-    pass "retries the poll before giving up, at both rates it is asked at"
+    pass "gives up only after both probe rounds are exhausted"
 else
     fail "expected $((PROBE_RETRIES * 2)) MON-VER attempts: [$(grep -c -- '-p MON-VER' "$UBX_LOG")]"
 fi
+no_mismatch "no wrong-rate write against a receiver that answers nothing"
 
-# One lost reply must not push it onto the assumed version when the receiver is
-# answering fine on the next attempt.
+# One lost reply is 8% likely and means nothing. It must not reach the assumed
+# version at all, let alone fail: the retry is what separates the two.
 start_receiver "$TARGET_BAUD"; lose_mon_ver_replies 1
-rc=0; configure_device /dev/ttyAMA0 >/dev/null 2>&1 || rc=$?
+rc=0; out=$(configure_device /dev/ttyAMA0 2>&1) || rc=$?
 if [ "$rc" -eq 0 ] && grep -q -- "-P $STUB_PROTVER" "$UBX_LOG"; then
     pass "a retry recovers the real protocol version after one lost reply"
 else
     fail "retry did not recover the protver (rc=$rc): [$(cat "$UBX_LOG")]"
 fi
+case "$out" in
+    *"no UBX reply"*) fail "fell back to the assumed version instead of retrying" ;;
+    *) pass "one lost reply never reaches the fallback" ;;
+esac
+no_mismatch "no wrong-rate write while retrying a lost reply"
+
+# Losing the whole first round is survivable when the second answers: below the
+# target rate the link has no headroom for a reply, which is the case the second
+# round exists for.
+start_receiver "$FACTORY_BAUD"; lose_mon_ver_replies "$PROBE_RETRIES"
+rc=0; out=$(configure_device /dev/ttyAMA0 2>&1) || rc=$?
+if [ "$rc" -eq 0 ] && grep -q -- "-P $STUB_PROTVER" "$UBX_LOG"; then
+    pass "a receiver moved up from 9600 is polled again at the target rate"
+else
+    fail "second round did not recover the protver (rc=$rc): [$out]"
+fi
+no_mismatch "no wrong-rate write when the first probe round is lost entirely"
+
+# A receiver that answers but names no version is not deaf, so it must not fail —
+# and the version it did not give must not be reported as one it did.
+start_receiver "$TARGET_BAUD"; STUB_NO_PROTVER=1
+rc=0; out=$(configure_device /dev/ttyAMA0 2>&1) || rc=$?
+if [ "$rc" -eq 0 ] && grep -q -- "-P $DEFAULT_PROTVER" "$UBX_LOG"; then
+    pass "a reply that names no version falls back without failing"
+else
+    fail "PROTVER-less reply mishandled (rc=$rc): [$out]"
+fi
+case "$out" in
+    *"assumed; the receiver named none"*) pass "does not claim a version the receiver never gave" ;;
+    *) fail "assumed version reported as reported: [$out]" ;;
+esac
+
+# The frame-error notice reports RX coming back, not going away, so it must not
+# abort a run: the receiver is listening again by the time we write.
+start_receiver "$TARGET_BAUD" "$RXOFF"
+rc=0; out=$(configure_device /dev/ttyAMA0 2>&1) || rc=$?
+if [ "$rc" -eq 0 ] && grep -q "SAVE" "$UBX_LOG"; then
+    pass "configures a receiver that reported the frame-error notice"
+else
+    fail "frame-error notice aborted the run (rc=$rc): [$out]"
+fi
+case "$out" in
+    *"frame errors"*) pass "reports the frame-error notice" ;;
+    *) fail "frame-error notice not reported: [$out]" ;;
+esac
 
 # Each ubxtool failure branch must abort the run and stop later steps.
 for step in "-S $TARGET_BAUD" "CFG-RATE" "MODEL" "SAVE"; do

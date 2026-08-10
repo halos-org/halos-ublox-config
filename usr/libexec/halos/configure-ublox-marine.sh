@@ -45,10 +45,11 @@ get_uart_devices() {
     done
 }
 
-# Listen to the port without transmitting. Transmitting at a baud the receiver
-# is not running at produces framing errors, and M8 firmware disables its UART
-# receiver after more than 100 of them; HALPI2 has no GNSS reset line, so that
-# state survives a warm reboot. Detection therefore has to be read-only.
+# Listen to the port without transmitting. Not because a wrong-rate write breaks
+# the receiver -- it rate-limits its RX for the rest of a one-second window and
+# re-enables it -- but because a write needs a rate, and guessing one is how a
+# receiver ends up moved to a baud nothing else uses and saved there. Listening
+# needs no guess and costs nothing, so detection is read-only.
 read_port() {
     local device="$1" baud="$2"
     stty -F "$device" "$baud" raw -echo -hupcl clocal 2>/dev/null || return 1
@@ -155,10 +156,12 @@ has_valid_nmea() {
     return 1
 }
 
-# The receiver announces this state itself, in a normal NMEA sentence, and keeps
-# transmitting afterwards -- so it is visible exactly where a passive read looks.
-# Only reachable in NMEA mode, which is where it matters: a receiver that latched
-# this way was never successfully configured, so it is still at factory defaults.
+# The receiver announces this in a normal NMEA sentence, and keeps transmitting
+# throughout, so it is visible exactly where a passive read looks. It reports RX
+# coming back rather than going away -- the interface is disabled only for the
+# remainder of the one-second window the frame errors fell in. So this is not a
+# state to recover from; it says something on the line is transmitting at a rate
+# the receiver is not using, which is worth a journal entry and nothing more.
 rx_disabled() {
     [[ "$(ascii_only "$1")" == *"UART RX was disabled"* ]]
 }
@@ -290,11 +293,17 @@ probe_receiver() {
 # answer. A longer wait does not help -- an oversubscribed receiver drops the
 # reply rather than delaying it -- so the retries are spaced instead, the load
 # that swallows one being bursty.
+# Returns 0 if the receiver answered at all, 1 if it never did -- and prints the
+# protocol version only when the reply actually carried one. The caller needs the
+# two apart: a receiver that answers without naming a version is not deaf, and
+# deafness is what the fatal check downstream keys on.
 probe_protver() {
     local device="$1" baud="$2" attempt=1 output
     while :; do
         if output=$(probe_receiver "$device" "$baud"); then
-            parse_protver "$output"
+            case "$output" in
+                *PROTVER=*) parse_protver "$output" ;;
+            esac
             return 0
         fi
         [ "$attempt" -ge "$PROBE_RETRIES" ] && return 1
@@ -413,8 +422,17 @@ configure_device() {
     # helps nobody.
     if [ "$DETECTED_RX_DISABLED" -eq 1 ]; then
         echo "WARNING: receiver reported >100 frame errors in a second and briefly"
-        echo "         disabled its UART RX. It re-enables itself; something on"
-        echo "         this line is transmitting at the wrong rate."
+        echo "         disabled its UART RX. It re-enables itself, but something on"
+        echo "         this line is transmitting at a rate it is not using, and this"
+        echo "         run has transmitted nothing — so it is not us."
+        # The scan has already run and its result is otherwise discarded on this
+        # path. Naming the process is the difference between a warning someone
+        # can act on and one they cannot.
+        local rx_holders
+        rx_holders="${holders_before:-}${holders_before:+ }$(port_holders "$device")"
+        if [ -n "${rx_holders// /}" ]; then
+            echo "         Holding the port: $rx_holders"
+        fi
     fi
 
     # A poll needs a reply, and a receiver filling its link cannot always deliver
@@ -424,16 +442,19 @@ configure_device() {
     # arrives even with a 12 s wait. Measured again at 115200, where the link runs
     # at about half capacity and 7 of 90 polls still went unanswered.
     #
-    # So the poll is advisory at every rate. Its only product is the protocol
-    # version, the default is 18 and M8 hardware reports 18, and failing on a
-    # missing reply costs the whole configuration -- roughly one run in twelve on
-    # a receiver that is working perfectly.
-    local protver protver_known=1
-    if ! protver=$(probe_protver "$device" "$current_baud"); then
-        protver="$DEFAULT_PROTVER"
-        protver_known=0
-        echo "WARNING: no UBX reply at ${current_baud} bps after $PROBE_RETRIES tries."
-        echo "         Assuming protocol $protver and configuring anyway."
+    # So one missing reply proves nothing. It is the only evidence that the
+    # receiver hears us at all, though, so it is not discarded either -- see the
+    # second round below, which decides.
+    local protver="$DEFAULT_PROTVER" protver_known=0 answered=0 reported=""
+    if reported=$(probe_protver "$device" "$current_baud"); then
+        answered=1
+        if [ -n "$reported" ]; then
+            protver="$reported"
+            protver_known=1
+        fi
+    else
+        echo "WARNING: no UBX reply at ${current_baud} bps in $PROBE_RETRIES tries;"
+        echo "         assuming protocol $protver for now and asking again later."
     fi
 
     if [ "$current_baud" -ne "$TARGET_BAUD" ]; then
@@ -470,21 +491,41 @@ configure_device() {
     # transmitting, accepting commands, answering nothing, and looking to every
     # later boot like a receiver that is not there.
     #
-    # Worth asking again at the target rate if the earlier answer went missing --
-    # the link has more headroom here -- but the assignment is guarded, because a
-    # failed command substitution would otherwise overwrite the assumed version
-    # with an empty string and address the receiver with no protocol at all.
+    # A second round, and the one that decides. It serves two ends: after a baud
+    # change the link finally has the headroom the first round lacked, and where
+    # there was no baud change it separates bad luck from a receiver that cannot
+    # hear us at all.
+    #
+    # That second job is why this round is not skipped when the rate did not
+    # change. The poll is the only bidirectional evidence the script has -- a
+    # receiver that answers nothing will not accept CFG-RATE either, and writing
+    # it anyway reports a healthy unit over a dead GPS chain. One dropped reply
+    # proves nothing at an 8% loss rate; six in a row is a different claim. How
+    # much stronger is not quantified: the losses are bursty, which is why the
+    # retries are spaced, so they are not independent and 0.08^6 is not the odds.
+    #
+    # The assignment is guarded because a failed command substitution would
+    # otherwise blank the assumed version and address the receiver with none.
     if [ "$protver_known" -eq 0 ]; then
-        local retry_protver
-        if retry_protver=$(probe_protver "$device" "$current_baud"); then
-            protver="$retry_protver"
-            protver_known=1
+        if reported=$(probe_protver "$device" "$current_baud"); then
+            answered=1
+            if [ -n "$reported" ]; then
+                protver="$reported"
+                protver_known=1
+            fi
+        fi
+        if [ "$answered" -eq 0 ]; then
+            echo "ERROR: no UBX reply at ${current_baud} bps in $((PROBE_RETRIES * 2)) tries."
+            echo "       Individual replies do go missing on a busy link, but not this"
+            echo "       many in a row: the receiver is not hearing us. Check the host"
+            echo "       TX line. Nothing was configured."
+            return 1
         fi
     fi
     if [ "$protver_known" -eq 1 ]; then
         echo "Protocol version: $protver"
     else
-        echo "Protocol version: $protver (assumed; the receiver never answered)"
+        echo "Protocol version: $protver (assumed; the receiver named none)"
     fi
 
     echo "Setting 10 Hz update rate..."
@@ -508,11 +549,11 @@ configure_device() {
 # (or a leftover manual workaround) can't leave gpsd opening the port at the wrong
 # baud.
 #
-# The rate is a parameter because gpsd is the second source of the frame-error
-# flood: pointed at a receiver still at 9600, it transmits its own probes at
-# 115200 and can disable the receiver's UART RX by itself. Matching gpsd to where
-# the hardware actually is yields a degraded-but-working GPS rather than a
-# bricked one when configuration failed.
+# The rate is a parameter because gpsd cannot read a receiver it is pointed at
+# with the wrong speed: it sees framing garbage, finds no packets, and its own
+# probes go out at a rate the receiver keeps discarding. Matching gpsd to where
+# the hardware actually is leaves a working GPS rather than a silent one when
+# configuration failed.
 reconcile_gpsd_speed() {
     local baud="$1"
     [ -f "$GPSD_DEFAULTS" ] || return 0
