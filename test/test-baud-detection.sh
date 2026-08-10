@@ -3,9 +3,11 @@
 #
 # The property under test is that the script transmits nothing until it has
 # established the receiver's current baud by listening. Transmitting UBX at a
-# mismatched rate produces framing errors, and u-blox M8 firmware disables its
-# UART receiver after more than 100 of them -- a state that only a full power
-# removal clears, because HALPI2 has no GNSS reset line.
+# mismatched rate produces framing errors, and past 100 of them in a second the
+# receiver stops listening for the rest of that second (UBX-13003221 R28). It
+# re-enables itself, so this is wasted time rather than damage -- but a detection
+# pass that transmits can also strand a receiver at a rate nothing else uses,
+# which is not wasted time.
 #
 # read_port is the seam: it is the only function that touches the device, so
 # stubbing it lets every path be driven from a canned serial sample.
@@ -225,6 +227,12 @@ order_of() { { grep -n -e "$1" "$UBX_LOG" || true; } | head -1 | cut -d: -f1; }
 UBX_LOG=$(mktemp)
 MISMATCH_LOG=$(mktemp)
 RATE_FILE=$(mktemp)
+# How many MON-VER polls still have to go unanswered. In a file for the same
+# reason the rate is: probe_receiver runs ubxtool inside a command substitution,
+# and a subshell's writes to a variable are lost.
+MONVER_FAIL_FILE=$(mktemp)
+lose_mon_ver_replies() { printf '%s' "$1" > "$MONVER_FAIL_FILE"; }
+PROBE_RETRY_DELAY=0     # the retries are real; their spacing is not under test
 
 arg_after() {   # arg_after <flag> <args...>
     local want="$1" prev=""; shift
@@ -252,6 +260,16 @@ ubxtool() {
     if [ -n "$STUB_FAIL_ON" ]; then
         case "$*" in *"$STUB_FAIL_ON"*) return 1 ;; esac
     fi
+    # A dropped reply: ubxtool still exits 0, it just has no MON-VER to show.
+    case "$*" in
+        *MON-VER*)
+            local left; left=$(cat "$MONVER_FAIL_FILE")
+            if [ "$left" -gt 0 ]; then
+                printf '%s' "$((left - 1))" > "$MONVER_FAIL_FILE"
+                return 0
+            fi
+            ;;
+    esac
     # A set command lands even when polls get no reply.
     local newrate
     newrate=$(arg_after -S "$@") && printf '%s' "$newrate" > "$RATE_FILE"
@@ -276,6 +294,7 @@ start_receiver() {      # start_receiver <rate> [sample]
     STUB_FAIL_ON=""; STUB_SILENT_BELOW_TARGET=0
     HOLDERS=""; HOLDERS_BEFORE=""; PORT_BYTES=0; PORT_IS_USABLE=0
     DETECTED_CONTENDED=0
+    lose_mon_ver_replies 0
 }
 
 no_mismatch() {         # the safety property, asserted after every case
@@ -338,13 +357,39 @@ else
     fail "protocol fallback not exercised: [$(cat "$UBX_LOG")]"
 fi
 
-# Silent at the target rate is a real fault.
+# A poll whose reply never arrives must not cost the configuration. Measured at
+# 7 of 90 polls against a live 10 Hz receiver at the target rate, so failing here
+# threw away roughly one run in twelve on working hardware.
 start_receiver "$TARGET_BAUD"; STUB_FAIL_ON="MON-VER"
-rc=0; configure_device /dev/ttyAMA0 >/dev/null 2>&1 || rc=$?
-if [ "$rc" -eq 1 ] && ! grep -q "CFG-RATE" "$UBX_LOG"; then
-    pass "fails on a receiver that is silent at the target rate"
+rc=0; out=$(configure_device /dev/ttyAMA0 2>&1) || rc=$?
+if [ "$rc" -eq 0 ] && grep -q "CFG-RATE" "$UBX_LOG"; then
+    pass "configures anyway when the target-rate poll goes unanswered"
 else
-    fail "did not fail on a silent target-rate receiver (rc=$rc): [$(cat "$UBX_LOG")]"
+    fail "unanswered poll cost the configuration (rc=$rc): [$(cat "$UBX_LOG")]"
+fi
+if grep -q -- "-P $DEFAULT_PROTVER" "$UBX_LOG"; then
+    pass "falls back to the default protocol version"
+else
+    fail "did not use the default protver: [$(cat "$UBX_LOG")]"
+fi
+case "$out" in
+    *"assumed; the receiver never answered"*) pass "says the protocol version was assumed" ;;
+    *) fail "assumed protver not flagged in the output: [$out]" ;;
+esac
+if [ "$(grep -c -- '-p MON-VER' "$UBX_LOG")" -eq $((PROBE_RETRIES * 2)) ]; then
+    pass "retries the poll before giving up, at both rates it is asked at"
+else
+    fail "expected $((PROBE_RETRIES * 2)) MON-VER attempts: [$(grep -c -- '-p MON-VER' "$UBX_LOG")]"
+fi
+
+# One lost reply must not push it onto the assumed version when the receiver is
+# answering fine on the next attempt.
+start_receiver "$TARGET_BAUD"; lose_mon_ver_replies 1
+rc=0; configure_device /dev/ttyAMA0 >/dev/null 2>&1 || rc=$?
+if [ "$rc" -eq 0 ] && grep -q -- "-P $STUB_PROTVER" "$UBX_LOG"; then
+    pass "a retry recovers the real protocol version after one lost reply"
+else
+    fail "retry did not recover the protver (rc=$rc): [$(cat "$UBX_LOG")]"
 fi
 
 # Each ubxtool failure branch must abort the run and stop later steps.
@@ -493,7 +538,7 @@ else
     fail "missing port: rc=$rc transmitted [$(cat "$UBX_LOG")]"
 fi
 
-rm -f "$READ_LOG" "$UBX_LOG" "$MISMATCH_LOG" "$RATE_FILE" "$PORT_NODE"
+rm -f "$READ_LOG" "$UBX_LOG" "$MISMATCH_LOG" "$RATE_FILE" "$PORT_NODE" "$MONVER_FAIL_FILE"
 unset -f read_port ubxtool arg_after
 eval "$_ph_saved"; eval "$_pu_saved"; eval "$_pb_saved"
 

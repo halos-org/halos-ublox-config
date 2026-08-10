@@ -9,6 +9,8 @@ TARGET_RATE=100      # ms = 10 Hz
 TARGET_MODEL=5       # Sea
 DEFAULT_PROTVER=18
 UBXTOOL_WAIT=2       # seconds
+PROBE_RETRIES=3      # MON-VER attempts before falling back to DEFAULT_PROTVER
+PROBE_RETRY_DELAY=1  # seconds between them; the load that eats a reply is bursty
 SNIFF_SECONDS=3      # passive listen window per candidate baud
 SNIFF_FLUSH=0.5      # discard window for bytes framed at the previous baud
 SNIFF_MAX_BYTES=8192 # cap on a sample: enough to decide, bounded parse cost
@@ -281,6 +283,26 @@ probe_receiver() {
     echo "$output"
 }
 
+# The receiver's protocol version, or non-zero if it would not say.
+#
+# Retried because the reply goes missing on a link the receiver is already
+# filling: measured against a live 10 Hz MAX-M8Q at 115200, 7 of 90 polls got no
+# answer. A longer wait does not help -- an oversubscribed receiver drops the
+# reply rather than delaying it -- so the retries are spaced instead, the load
+# that swallows one being bursty.
+probe_protver() {
+    local device="$1" baud="$2" attempt=1 output
+    while :; do
+        if output=$(probe_receiver "$device" "$baud"); then
+            parse_protver "$output"
+            return 0
+        fi
+        [ "$attempt" -ge "$PROBE_RETRIES" ] && return 1
+        sleep "$PROBE_RETRY_DELAY"
+        attempt=$((attempt + 1))
+    done
+}
+
 # Bash regex, not `grep -oP`: -P is a GNU extension, so on BSD grep the match
 # silently fails and every receiver is addressed with the default version.
 parse_protver() {
@@ -382,35 +404,36 @@ configure_device() {
     RECEIVER_BAUD="$current_baud"
     echo "Receiver detected at ${current_baud} bps"
 
+    # Reported, not fatal. The receiver rate-limits its RX for the remainder of a
+    # one-second window after 100 frame errors and re-enables it at the end of
+    # that window -- the notice is emitted when RX comes back, not while it is
+    # gone (UBX-13003221 R28, UART section). Something is producing frame errors
+    # on this line and that is worth a journal entry, but it clears itself, and
+    # refusing to configure a receiver that will be listening a second later
+    # helps nobody.
     if [ "$DETECTED_RX_DISABLED" -eq 1 ]; then
-        echo "ERROR: receiver reports its UART RX disabled after excessive frame errors."
-        echo "       It cannot be reconfigured until power is fully removed — a warm"
-        echo "       reboot will not clear it. Leaving gpsd at ${current_baud} bps."
-        return 1
+        echo "WARNING: receiver reported >100 frame errors in a second and briefly"
+        echo "         disabled its UART RX. It re-enables itself; something on"
+        echo "         this line is transmitting at the wrong rate."
     fi
 
-    # A poll needs a reply, and a reply is exactly what a receiver on an
-    # oversubscribed link cannot deliver: at 10 Hz on 9600 it generates more than
-    # the line carries, its transmit buffer overflows, and poll replies are among
-    # what gets dropped -- while set commands, which travel the other way, still
-    # land. Measured on halpi.hurma: no MON-VER reply at 9600 even with a 12 s
-    # wait, yet a baud-change command sent at the same moment took effect.
+    # A poll needs a reply, and a receiver filling its link cannot always deliver
+    # one: its transmit buffer overflows and poll replies are among what gets
+    # dropped, while set commands, travelling the other way, still land. Measured
+    # at 9600, where 10 Hz oversubscribes the line eightfold and no MON-VER reply
+    # arrives even with a 12 s wait. Measured again at 115200, where the link runs
+    # at about half capacity and 7 of 90 polls still went unanswered.
     #
-    # So a silent receiver below the target rate is not a fault to abort on. It
-    # is most likely one this script itself stranded there, and refusing to act
-    # would leave it stranded for good. Assume the default protocol, move it up,
-    # and let the authoritative poll happen once the link has headroom.
-    local mon_ver protver="$DEFAULT_PROTVER" protver_known=0
-    if mon_ver=$(probe_receiver "$device" "$current_baud"); then
-        protver=$(parse_protver "$mon_ver")
-        protver_known=1
-    elif [ "$current_baud" -eq "$TARGET_BAUD" ]; then
-        echo "ERROR: receiver output seen at ${current_baud} bps but no UBX reply."
-        echo "       At the target rate there is no bandwidth excuse for this."
-        return 1
-    else
-        echo "WARNING: no UBX reply at ${current_baud} bps — assuming protocol"
-        echo "         ${protver} and moving the receiver up before configuring it."
+    # So the poll is advisory at every rate. Its only product is the protocol
+    # version, the default is 18 and M8 hardware reports 18, and failing on a
+    # missing reply costs the whole configuration -- roughly one run in twelve on
+    # a receiver that is working perfectly.
+    local protver protver_known=1
+    if ! protver=$(probe_protver "$device" "$current_baud"); then
+        protver="$DEFAULT_PROTVER"
+        protver_known=0
+        echo "WARNING: no UBX reply at ${current_baud} bps after $PROBE_RETRIES tries."
+        echo "         Assuming protocol $protver and configuring anyway."
     fi
 
     if [ "$current_baud" -ne "$TARGET_BAUD" ]; then
@@ -432,8 +455,8 @@ configure_device() {
             # setting alone, which is its existing behaviour for an unknown rate.
             RECEIVER_BAUD="$DETECTED_BAUD"
             if [ "$DETECTED_RX_DISABLED" -eq 1 ]; then
-                echo "ERROR: receiver latched UART RX disabled during this run."
-                echo "       Power must be fully removed; a warm reboot will not clear it."
+                echo "WARNING: receiver reported frame errors during this run; the"
+                echo "         baud command may have been sent into a rate-limited RX."
             fi
             echo "ERROR: receiver did not switch to $TARGET_BAUD (now at ${RECEIVER_BAUD:-unknown} bps)"
             return 1
@@ -446,12 +469,23 @@ configure_device() {
     # oversubscribes it, and a receiver left in that state is unpollable:
     # transmitting, accepting commands, answering nothing, and looking to every
     # later boot like a receiver that is not there.
+    #
+    # Worth asking again at the target rate if the earlier answer went missing --
+    # the link has more headroom here -- but the assignment is guarded, because a
+    # failed command substitution would otherwise overwrite the assumed version
+    # with an empty string and address the receiver with no protocol at all.
     if [ "$protver_known" -eq 0 ]; then
-        mon_ver=$(probe_receiver "$device" "$current_baud") \
-            || { echo "ERROR: still no UBX reply at ${current_baud} bps"; return 1; }
-        protver=$(parse_protver "$mon_ver")
+        local retry_protver
+        if retry_protver=$(probe_protver "$device" "$current_baud"); then
+            protver="$retry_protver"
+            protver_known=1
+        fi
     fi
-    echo "Protocol version: $protver"
+    if [ "$protver_known" -eq 1 ]; then
+        echo "Protocol version: $protver"
+    else
+        echo "Protocol version: $protver (assumed; the receiver never answered)"
+    fi
 
     echo "Setting 10 Hz update rate..."
     run_ubxtool "$device" "$current_baud" "$protver" -p "CFG-RATE,$TARGET_RATE" \
