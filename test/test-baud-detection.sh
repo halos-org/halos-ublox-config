@@ -366,13 +366,24 @@ else
 fi
 eval "$_rp_saved"
 
-# A device listed in DEVICES that says nothing is a fault, not an absence.
+# --- silence: absence unless a fault is evidenced ---
+# The port has to exist for these, because a missing one is itself one of the
+# faults under test. A regular file stands in for the tty: nothing here reads it,
+# read_port is stubbed, and only the path's existence is inspected.
+PORT_NODE=$(mktemp)
+HOLDERS=""
+_ph_saved=$(declare -f port_holders)
+port_holders() { printf '%s' "$HOLDERS"; }
+
+# The reason this issue exists: /etc/default/gpsd lists the port on every HALPI2
+# marine image whether or not a module is fitted, so silence on an idle port is a
+# hardware configuration and must not fail the unit.
 start_receiver 4800    # neither candidate rate
-rc=0; configure_device /dev/ttyAMA0 >/dev/null 2>&1 || rc=$?
-if [ "$rc" -eq 1 ] && [ ! -s "$UBX_LOG" ] && [ -z "$RECEIVER_BAUD" ]; then
-    pass "unheard device fails the unit and transmits nothing"
+rc=0; configure_device "$PORT_NODE" >/dev/null 2>&1 || rc=$?
+if [ "$rc" -eq "$NO_RECEIVER_RC" ] && [ ! -s "$UBX_LOG" ] && [ -z "$RECEIVER_BAUD" ]; then
+    pass "an idle, unheld port reports no receiver and transmits nothing"
 else
-    fail "unheard device: rc=$rc transmitted [$(cat "$UBX_LOG")]"
+    fail "idle port: rc=$rc transmitted [$(cat "$UBX_LOG")]"
 fi
 if [ "$(grep -c '^read_port' "$READ_LOG")" -eq $((DETECT_RETRIES * 2)) ]; then
     pass "retries detection before declaring a device silent"
@@ -380,8 +391,69 @@ else
     fail "expected $((DETECT_RETRIES * 2)) listens, got: [$(cat "$READ_LOG")]"
 fi
 
-rm -f "$READ_LOG" "$UBX_LOG" "$MISMATCH_LOG" "$RATE_FILE"
+# Something else eating the receiver's bytes looks exactly like an empty port,
+# and was one of the two field failures that used to exit 0.
+start_receiver 4800; HOLDERS="gpsd[431]"
+rc=0; out=$(configure_device "$PORT_NODE" 2>&1) || rc=$?
+if [ "$rc" -eq 1 ]; then
+    pass "a held port fails the unit"
+else
+    fail "held port did not fail (rc=$rc)"
+fi
+case "$out" in
+    *"gpsd[431]"*) pass "names what is holding the port" ;;
+    *) fail "holder not named: [$out]" ;;
+esac
+HOLDERS=""
+
+# A port named in DEVICES that does not exist is a broken image, not a missing
+# module: gpsd cannot open it either.
+start_receiver 4800
+rc=0; configure_device "$PORT_NODE.absent" >/dev/null 2>&1 || rc=$?
+if [ "$rc" -eq 1 ]; then
+    pass "a port that does not exist fails the unit"
+else
+    fail "missing port did not fail (rc=$rc)"
+fi
+
+rm -f "$READ_LOG" "$UBX_LOG" "$MISMATCH_LOG" "$RATE_FILE" "$PORT_NODE"
 unset -f read_port ubxtool arg_after
+eval "$_ph_saved"
+
+# --- port_holders: reads the real /proc, so only where there is one ---
+if [ -d /proc/self/fd ]; then
+    HELD_FILE=$(mktemp)
+    # A held descriptor, kept open by a process that is not this one.
+    sleep 30 < "$HELD_FILE" &
+    holder_pid=$!
+    # The kernel resolves symlinks in the temp path, and readlink reports the
+    # resolved target, so compare against the same form.
+    held_real=$(readlink "/proc/$holder_pid/fd/0" 2>/dev/null || printf '%s' "$HELD_FILE")
+    found=$(port_holders "$held_real")
+    case "$found" in
+        *"sleep[$holder_pid]"*) pass "port_holders names the process holding a device" ;;
+        *) fail "port_holders missed the holder: [$found]" ;;
+    esac
+    if [ -z "$(port_holders "$held_real.unheld")" ]; then
+        pass "port_holders reports nothing for a path no one has open"
+    else
+        fail "port_holders invented a holder"
+    fi
+    # The script reads the port itself; counting its own shell would make every
+    # silent port look held and reinstate the failure this change removes.
+    exec 9< "$HELD_FILE"
+    if [ -z "$(port_holders "$held_real" | grep -o "\[$$\]" || true)" ]; then
+        pass "port_holders excludes the shell doing the reading"
+    else
+        fail "port_holders counted our own descriptor"
+    fi
+    exec 9<&-
+    kill "$holder_pid" 2>/dev/null || true
+    wait "$holder_pid" 2>/dev/null || true
+    rm -f "$HELD_FILE"
+else
+    echo "skip - port_holders tests need /proc (not this platform)"
+fi
 
 if [ "$failures" -ne 0 ]; then
     echo "$failures test(s) failed"

@@ -23,7 +23,7 @@ ROM-based u-blox modules (such as the MAX-M8Q on HALPI2) have no flash memory. C
 5. Saves settings to BBR (persists until next power loss)
 6. Points gpsd's `-s` speed at the receiver's actual rate
 
-A device listed in `/etc/default/gpsd` that produces nothing at either rate fails the service, rather than passing as "no receiver". gpsd will open and transmit into that device regardless, so silence there is a fault worth seeing.
+A device listed in `/etc/default/gpsd` that produces nothing is reported as having no receiver, and the service still succeeds. The listing is not evidence that hardware is there: pi-gen writes the HALPI2 UART into that file for every marine image, fitted module or not, and the port itself belongs to the SoC. Two causes of silence *are* faults and do fail the service — a port that does not exist, and a port another process is holding, since a holder consumes the receiver's output and makes a working module look absent.
 
 ## Why detection is read-only
 
